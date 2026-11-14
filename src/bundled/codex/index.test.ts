@@ -100,6 +100,7 @@ it("adopts and carries an agent's instructions and workspace, nothing else", () 
       isOverride: false,
       unchangedKey: "thread",
     },
+    { id: "apps", label: "Codex apps and plugins", isOverride: false },
   ]);
   expect(
     type?.describeMigration?.({
@@ -107,6 +108,7 @@ it("adopts and carries an agent's instructions and workspace, nothing else", () 
       model: "gpt-5",
       effort: "high",
       scope: "channel",
+      apps: true,
     }),
   ).toEqual([
     { id: "model", label: "Model", isOverride: true },
@@ -117,6 +119,7 @@ it("adopts and carries an agent's instructions and workspace, nothing else", () 
       isOverride: true,
       unchangedKey: "channel",
     },
+    { id: "apps", label: "Codex apps and plugins", isOverride: true },
   ]);
   expect(type?.migrationWarning).toBe(
     "Any commands Codex left running will stop.",
