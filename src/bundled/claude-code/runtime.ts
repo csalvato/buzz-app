@@ -670,7 +670,16 @@ export class ClaudeRuntime {
           const text = this.review(entry, prepared, notes);
           // A mention's request shows the host's fallback notice; a wake's
           // shows in Activity, as does any attribution notice.
-          let notice = wake ? gatewayFallback?.notice : undefined;
+          const fallback = wake ? gatewayFallback?.notice : undefined;
+          let notice = fallback;
+          const attribute = this.attribution(
+            agent.key,
+            gateway,
+            "resume",
+            (text) => {
+              notice = text;
+            },
+          );
           // A conversation's tools default to its thread; a session shared by
           // several threads is told which to reply in instead.
           entry.contexts.set(
@@ -710,14 +719,12 @@ export class ClaudeRuntime {
               ...(effort ? { effort } : {}),
             },
             admit,
-            attribute: this.attribution(
-              agent.key,
-              gateway,
-              "resume",
-              (text) => {
-                notice = text;
-              },
-            ),
+            // A retry on another process starts from the fallback again, so
+            // an earlier attempt's notice never outlives its process.
+            attribute: (process, saved) => {
+              notice = fallback;
+              return attribute(process, saved);
+            },
             submitted: (uuid: string) => {
               if (notice) this.noted(agent.key, uuid, notice);
             },

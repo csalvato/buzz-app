@@ -125,8 +125,8 @@ describe("ClaudeProcess.attribute", () => {
       .map((message) => (message.request as { subtype?: string })?.subtype)
       .filter(Boolean);
 
-  async function started(env: Record<string, string>) {
-    const { spawn, processes } = fakeSpawn(undefined, env);
+  async function started(env: Record<string, string>, provider?: string) {
+    const { spawn, processes } = fakeSpawn(undefined, env, provider);
     const claude = await ClaudeProcess.start(spawn, launch);
     const fake = processes[0];
     if (!fake) throw new Error("no process");
@@ -187,7 +187,12 @@ describe("ClaudeProcess.attribute", () => {
     await expect(provider.claude.attribute(attribution(null))).resolves.toBe(
       PROVIDER,
     );
-    for (const { fake } of [elsewhere, provider])
+    // A selector in Claude's process env shows only in what it resolved.
+    const resolved = await started(ON_GATEWAY, "bedrock");
+    await expect(resolved.claude.attribute(attribution(null))).resolves.toBe(
+      PROVIDER,
+    );
+    for (const { fake } of [elsewhere, provider, resolved])
       expect(subtypes(fake.received)).not.toContain("apply_flag_settings");
   });
 

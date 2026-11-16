@@ -204,6 +204,8 @@ export class ClaudeProcess {
   private readingEffort: Promise<void> | undefined;
   /** Its own settings, read once before Buzz's first attribution. */
   private baseline: Promise<Baseline | undefined> | undefined;
+  /** The provider `initialize` reported, such as "firstParty". */
+  private provider: Promise<string | undefined> = Promise.resolve(undefined);
   /** The custom headers Buzz last applied; undefined while it applied none. */
   private attributed: string | undefined;
   readonly exited: Promise<number | null>;
@@ -497,6 +499,18 @@ export class ClaudeProcess {
             )
           : [];
       });
+      // Claude's resolved provider, which its process env can pick too.
+      this.provider = answer.then(
+        (response) => {
+          const account = (response.response as Message | undefined)?.account as
+            | Message
+            | undefined;
+          return typeof account?.apiProvider === "string"
+            ? account.apiProvider
+            : undefined;
+        },
+        () => undefined,
+      );
     } catch (error) {
       await this.kill();
       await this.exited;
@@ -557,7 +571,9 @@ export class ClaudeProcess {
     );
     const baseline = await this.baseline;
     if (!baseline) return attribution && UNREADABLE;
-    const reason = attribution && ineligible(baseline, attribution.origin);
+    const reason =
+      attribution &&
+      ineligible(baseline, attribution.origin, await this.provider);
     const headers =
       attribution && !reason
         ? customHeaders(

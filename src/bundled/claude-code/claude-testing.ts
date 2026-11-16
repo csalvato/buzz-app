@@ -30,6 +30,8 @@ export type FakeClaude = {
   headers: (string | undefined)[];
   /** When set, an `apply_flag_settings` that sets env is refused. */
   refuseEnv?: boolean;
+  /** The `account.apiProvider` its `initialize` answer reports. */
+  apiProvider: string;
   /** When set, a turn stays open until `finish()`. */
   hold: boolean;
   killed: boolean;
@@ -71,10 +73,12 @@ export const CLAUDES: ReadonlySet<string> = new Set([
 
 /** A spawn whose Claude processes answer like Claude, on an Apple silicon
  * Mac. Sessions named in `known` (or created by a process) can be resumed;
- * others fail to load. Each starts with `env` as its settings' env. */
+ * others fail to load. Each starts with `env` as its settings' env and
+ * reports `apiProvider` at `initialize`. */
 export function fakeSpawn(
   known = new Set<string>(),
   env: Readonly<Record<string, string>> = {},
+  apiProvider = "firstParty",
 ) {
   const processes: FakeClaude[] = [];
   const spawn = async (id: string, options: HostProcessOptions = {}) => {
@@ -111,6 +115,7 @@ export function fakeSpawn(
       model: flag("--model") ?? "default",
       models: [],
       env: { ...env },
+      apiProvider,
       headers: [],
       hold: false,
       killed: false,
@@ -207,7 +212,12 @@ export function fakeSpawn(
                 }
               : {}),
             ...(request.subtype === "initialize"
-              ? { response: { models: MODELS } }
+              ? {
+                  response: {
+                    models: MODELS,
+                    account: { apiProvider: fake.apiProvider },
+                  },
+                }
               : {}),
           },
         });

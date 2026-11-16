@@ -26,6 +26,8 @@ export const PROVIDERS = [
   "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
 ] as const;
 const ON = new Set(["1", "true", "yes", "on"]);
+/** Claude's `account.apiProvider` for Anthropic's own API (2.1.325). */
+const FIRST_PARTY = "firstParty";
 
 /** One turn's attribution: the build's gateway origin, which Claude's own
  * endpoint must be on, and the shared contract's validated bundle. */
@@ -46,7 +48,7 @@ export type Baseline = Readonly<{
 
 const NOTICE = "Not attributed in the agent gateway";
 export const UNREADABLE = `${NOTICE}: Claude didn't report its settings.`;
-export const UNAPPLIED = `${NOTICE}: Claude didn't take this turn's headers.`;
+export const UNAPPLIED = `${NOTICE}: Claude didn't take this turn's headers, so it may still send an earlier turn's.`;
 export const PROVIDER = `${NOTICE}: Claude is set to use another provider.`;
 export const ELSEWHERE = `${NOTICE}: Claude's own endpoint isn't the agent gateway.`;
 export const PROTECTED = `${NOTICE}: protected Claude agents keep their own pinned launch.`;
@@ -74,9 +76,17 @@ export function readBaseline(answer: unknown): Baseline | undefined {
 }
 
 /** Why `baseline` can't carry attribution for `origin`, as a notice. The
- * origin is compared (scheme, host and port), never the mode path. */
-export function ineligible(baseline: Baseline, origin: string) {
-  if (baseline.provider) return PROVIDER;
+ * origin is compared (scheme, host and port), never the mode path.
+ * `provider` is what Claude's `initialize` resolved, which also sees a
+ * selector in its process env; only Anthropic's API ("firstParty") or an
+ * older Claude that reports none passes. */
+export function ineligible(
+  baseline: Baseline,
+  origin: string,
+  provider?: string,
+) {
+  if (baseline.provider || (provider !== undefined && provider !== FIRST_PARTY))
+    return PROVIDER;
   if (originOf(baseline.endpoint) !== originOf(origin)) return ELSEWHERE;
 }
 
