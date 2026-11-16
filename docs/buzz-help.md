@@ -512,11 +512,15 @@ available rather than silently discarding it.
   uses the gateway's models unless its Settings shows Model gateway.
 - Where a build enables it, a Claude agent whose own Claude settings already
   point at the agent gateway adds Buzz's session, agent and conversation
-  headers to each turn, keeping its other custom headers. Buzz never changes
-  Claude's endpoint, sign-in or provider. A turn that can't be attributed
-  (another endpoint or provider, settings Claude didn't report or take, or
-  custom headers set only in the environment Buzz was started from, which
-  Buzz leaves as they are)
+  headers to each turn, keeping its other custom headers. Buzz rereads
+  Claude's settings at each new turn, so an edited endpoint or header counts
+  from the next turn; when attribution stops, Buzz puts back the person's
+  current headers. Buzz never changes Claude's endpoint, sign-in or provider.
+  A turn that can't be attributed (another endpoint or provider, settings
+  Claude didn't report or take, a managed policy's or another tool's Claude
+  settings, which Buzz leaves alone, or custom headers set only in the
+  environment Buzz was started from, which Buzz leaves as they are; Claude
+  itself doesn't go back to those once a settings file's headers are removed)
   still runs, and Activity notes "Not attributed in the agent gateway" with
   the reason. Protected Claude agents are not attributed yet: their pinned
   launch ignores Claude's settings files, including a gateway app's.

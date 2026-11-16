@@ -23,15 +23,25 @@ export type FakeClaude = {
   model: string;
   /** The model each user message was taken on. */
   models: string[];
-  /** Its effective settings env, which `get_settings` reports and
-   * `apply_flag_settings` merges over key by key. */
+  /** Its user settings file's env, which a test may rewrite as a running
+   * Claude reloads it. */
   env: Record<string, string>;
+  /** Its flag layer's env, which `apply_flag_settings` replaces whole. */
+  flagEnv: Record<string, string> | undefined;
+  /** A managed policy's env, which outranks the flag layer. */
+  policyEnv?: Record<string, string>;
+  /** The env in effect: user, then flag, then policy. */
+  effective(): Record<string, string>;
   /** The custom headers each user message was taken with. */
   headers: (string | undefined)[];
   /** When set, an `apply_flag_settings` that sets env is refused. */
   refuseEnv?: boolean;
-  /** Control requests of this subtype go unanswered until `answerLate()`. */
-  withhold?: string | undefined;
+  /** Control requests of this subtype, or that this picks, go unanswered
+   * until `answerLate()`. */
+  withhold?:
+    | string
+    | ((request: Record<string, unknown>) => boolean)
+    | undefined;
   /** Takes the withheld control requests, as a late Claude would. */
   answerLate(): void;
   /** The `account.apiProvider` its `initialize` answer reports. */
@@ -127,6 +137,8 @@ export function fakeSpawn(
       model: flag("--model") ?? "default",
       models: [],
       env: { ...env },
+      flagEnv: undefined,
+      effective: () => ({ ...fake.env, ...fake.flagEnv, ...fake.policyEnv }),
       apiProvider,
       headers: [],
       hold: false,
@@ -163,6 +175,7 @@ export function fakeSpawn(
       },
     };
     const withheld: Record<string, unknown>[] = [];
+    let sent: string | undefined;
     fake.answerLate = () => {
       const withhold = fake.withhold;
       fake.withhold = undefined;
@@ -174,7 +187,12 @@ export function fakeSpawn(
       fake.received.push(message);
       if (message.type === "control_request") {
         const request = message.request as Record<string, unknown>;
-        if (request.subtype === fake.withhold) {
+        const { withhold } = fake;
+        if (
+          typeof withhold === "function"
+            ? withhold(request)
+            : request.subtype === withhold
+        ) {
           withheld.push(message);
           return;
         }
@@ -206,7 +224,7 @@ export function fakeSpawn(
             });
             return;
           }
-          Object.assign(fake.env, env);
+          fake.flagEnv = { ...env };
         }
         if (request.subtype === "interrupt" && fake.interruptError) {
           fake.emit({
@@ -231,7 +249,26 @@ export function fakeSpawn(
                       effort: fake.effort,
                       model: resolved(fake.model),
                     },
-                    effective: { env: { ...fake.env } },
+                    effective: { env: fake.effective() },
+                    sources: [
+                      { source: "userSettings", settings: { env: fake.env } },
+                      ...(fake.flagEnv
+                        ? [
+                            {
+                              source: "flagSettings",
+                              settings: { env: fake.flagEnv },
+                            },
+                          ]
+                        : []),
+                      ...(fake.policyEnv
+                        ? [
+                            {
+                              source: "policySettings",
+                              settings: { env: fake.policyEnv },
+                            },
+                          ]
+                        : []),
+                    ],
                   },
                 }
               : {}),
@@ -256,7 +293,9 @@ export function fakeSpawn(
       fake.prompts.push(content);
       fake.efforts.push(fake.effort);
       fake.models.push(fake.model);
-      fake.headers.push(fake.env.ANTHROPIC_CUSTOM_HEADERS);
+      // As Claude does, a value no settings set any more stays in its env.
+      sent = fake.effective().ANTHROPIC_CUSTOM_HEADERS ?? sent;
+      fake.headers.push(sent);
       if (!started) {
         started = true;
         known.add(session);

@@ -1,10 +1,14 @@
 import { CLAUDE_HOOK_EVENTS, type ClaudeHook } from "./hooks";
 import {
   type Attribution,
-  type Baseline,
   customHeaders,
   ineligible,
-  readBaseline,
+  FOREIGN,
+  HEADERS,
+  MASKED,
+  readSettings,
+  SHARED,
+  STALE,
   UNAPPLIED,
   UNREADABLE,
 } from "./attribution";
@@ -230,15 +234,17 @@ export class ClaudeProcess {
   /** The session's own effort, read before the first change to restore it. */
   private ownEffort: string | undefined;
   private readingEffort: Promise<void> | undefined;
-  /** Its own settings, read once before Buzz's first attribution. */
-  private baseline: Promise<Baseline | undefined> | undefined;
   /** Whether its inherited env sets custom headers; undefined if unknown. */
   private inherited: () => Promise<boolean | undefined> = async () => undefined;
   /** The provider `initialize` reported, such as "firstParty". */
   private provider: Promise<string | undefined> = Promise.resolve(undefined);
-  /** The custom headers Buzz last applied; undefined while it applied none,
-   * null when a change it asked for may or may not have taken. */
+  /** The custom headers Buzz last applied; undefined while none of its
+   * are in effect, null when a change may or may not have taken. */
   private attributed: string | null | undefined;
+  /** Buzz has written its headers to this process at least once. */
+  private wrote = false;
+  /** Its flag env held something before Buzz's first write. */
+  private foreign = false;
   readonly exited: Promise<number | null>;
 
   private constructor(
@@ -590,57 +596,74 @@ export class ClaudeProcess {
   }
 
   /** Sets the custom headers the turns sent after it carry: `attribution`'s
-   * over the process's own when its own endpoint is the gateway's, else its
-   * own alone. A steer into a running turn keeps the turn's. Resolves with
+   * over the person's current own when Claude's current endpoint is the
+   * gateway's, else removes Buzz's. A steer into a running turn keeps the turn's. Resolves with
    * why the turn isn't attributed, as a notice; never throws, so a failure
    * never stops the turn. */
   async attribute(
     attribution: Attribution | undefined,
   ): Promise<string | undefined> {
     if (!attribution && this.attributed === undefined) return;
-    // Read before Buzz's first change, so it is always the person's own.
-    this.baseline ??= Promise.all([
-      this.attributionCall({ subtype: "get_settings" }).then(readBaseline),
+    // Read fresh each time: Claude reloads its settings files while it runs.
+    const [read, inherited] = await Promise.all([
+      this.attributionCall({ subtype: "get_settings" }).then(readSettings),
       this.inherited(),
-    ]).then(([baseline, inherited]) => baseline && { ...baseline, inherited });
-    const baseline = await this.baseline;
-    // Unread, so Buzz changed nothing: a later turn asks again.
-    if (!baseline) {
-      this.baseline = undefined;
-      return attribution && UNREADABLE;
-    }
+    ]);
+    if (!read) return this.attributed === undefined ? UNREADABLE : STALE;
+    // Before Buzz's first write the flag env isn't Buzz's; after it, any
+    // other key there would be erased by Buzz's next write.
+    if (!this.wrote && read.flag.any) this.foreign = true;
+    if (this.wrote && read.flag.others)
+      return this.attributed === undefined ? FOREIGN : SHARED;
     const reason =
       attribution &&
-      ineligible(baseline, attribution.origin, await this.provider);
+      (this.foreign
+        ? FOREIGN
+        : ineligible(
+            { ...read, inherited },
+            attribution.origin,
+            await this.provider,
+          ));
     const headers =
       attribution && !reason
-        ? customHeaders(
-            attribution.profile,
-            baseline.headers,
-            attribution.headers,
-          )
-        : (baseline.headers ?? "");
-    const current =
-      this.attributed === undefined
-        ? (baseline.headers ?? "")
-        : this.attributed;
-    if (headers === current) return reason;
-    // Only the one env key: Claude merges flag settings key by key, so its
-    // endpoint, sign-in, effort and model stay as they are.
-    // A change Claude takes late may undo a newer one, so its headers are
-    // unknown again and the next change is written whatever it is.
+        ? customHeaders(attribution.profile, read.headers, attribution.headers)
+        : undefined;
+    // Settings can't show what Claude still sends, so Buzz's own record
+    // decides; unknown (null) is always written again.
+    if (headers === this.attributed) return reason;
+    if (headers !== undefined) {
+      this.wrote = true;
+      const ok = await this.applyEnv({ [HEADERS]: headers });
+      this.attributed = ok ? headers : null;
+      return ok ? reason : UNAPPLIED;
+    }
+    // Removal first sets the person's current headers, or none: with no
+    // settings value to fall back on, Claude would keep sending Buzz's.
+    // Then it clears the flag env, so later settings changes take effect.
+    if (!(await this.applyEnv({ [HEADERS]: read.headers ?? "" }))) {
+      this.attributed = null;
+      return UNAPPLIED;
+    }
+    if (!(await this.applyEnv({}))) {
+      this.attributed = null;
+      return MASKED;
+    }
+    this.attributed = undefined;
+    return reason;
+  }
+
+  /** Replaces the flag layer's env (Claude replaces `env` whole, though it
+   * merges top-level flag keys such as effort one by one); whether Claude
+   * confirmed it. A late answer leaves Buzz's record unknown, since it may
+   * undo a newer write. */
+  private async applyEnv(env: Record<string, string>) {
     const answer = await this.attributionCall(
-      {
-        subtype: "apply_flag_settings",
-        settings: { env: { ANTHROPIC_CUSTOM_HEADERS: headers } },
-      },
+      { subtype: "apply_flag_settings", settings: { env } },
       () => {
         this.attributed = null;
       },
     );
-    // Unknown until a later change takes, which a restore then still sends.
-    this.attributed = answer.subtype === "success" ? headers : null;
-    return answer.subtype === "success" ? reason : UNAPPLIED;
+    return answer.subtype === "success";
   }
 
   /** A control call attribution makes, answered as an error when it fails or
