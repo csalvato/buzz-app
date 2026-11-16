@@ -89,10 +89,7 @@ import {
   type GatewayBinding,
   type TurnContext,
 } from "../../features/agents/gateway/contract";
-import {
-  compactRefusal,
-  controlTurn,
-} from "../../features/agents/gateway/forwarding";
+import { controlTurn } from "../../features/agents/gateway/forwarding";
 import { fallbackNotice } from "../../features/agents/gateway/route";
 import {
   controlRoute,
@@ -658,11 +655,11 @@ export class CodexRuntime {
         throw new Error("The protected agent has no live policy binding");
       const thread = resumable(saved, this.handle(agent.key)?.protection);
       if (!thread) throw new Error("There is no session here to compact yet.");
-      // Where a turn would fall back from the gateway, compaction fails
-      // before anything runs, as Claude's does.
+      // Where a turn would fall back from the gateway, compaction runs as
+      // configured too, without the context, and says so.
       const control = controlRoute(this.routes, agent.key);
-      if (control?.kind === "blocked")
-        throw new Error(compactRefusal(fallbackNotice(control.route)));
+      let notice =
+        control?.kind === "blocked" ? fallbackNotice(control.route) : undefined;
       const server = this.open(this.handle(agent.key));
       const rpc = await server.opening;
       const settings = this.resolveConfig(agent.config);
@@ -676,7 +673,8 @@ export class CodexRuntime {
       let { params } = prepared;
       // Through the gateway where the agent's turns go, under the control's
       // own context and the thread's Buzz session.
-      const gateway = control?.gateway;
+      const gateway =
+        control?.kind === "eligible" ? control.gateway : undefined;
       const headed = this.gatewayParams(prepared, gateway);
       try {
         if (gateway && headed) {
@@ -694,6 +692,7 @@ export class CodexRuntime {
           );
           // Without its context, compaction still runs.
           if (routed.ok) params = routed.value;
+          else notice = unattributed(routed.message);
         }
         signal.throwIfAborted();
         bridge?.bind(thread.threadId);
@@ -704,7 +703,7 @@ export class CodexRuntime {
         });
         signal.throwIfAborted();
         await this.compact(rpc, signal, thread.threadId, agent.key, key);
-        this.status(agent.key, key, "Idle");
+        this.status(agent.key, key, "Idle", notice);
       } catch (error) {
         this.status(
           agent.key,

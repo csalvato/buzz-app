@@ -42,9 +42,10 @@ import {
   REMOTE_UNATTRIBUTED,
   type ProviderConfig,
 } from "./gateway";
-import type {
-  EligibleRoute,
-  GatewayRoute,
+import {
+  fallbackNotice,
+  type EligibleRoute,
+  type GatewayRoute,
 } from "../../features/agents/gateway/route";
 import {
   VECTOR_IDENTITY,
@@ -6969,8 +6970,8 @@ describe("gateway turns", () => {
     );
   });
 
-  it("compacts through the gateway under the control's context and the thread's Buzz session, and refuses where turns would fall back", async () => {
-    const { f, gatewayed, agent, move } = routed();
+  it("compacts through the gateway under the control's context and the thread's Buzz session", async () => {
+    const { f, gatewayed, agent } = routed();
     const place = { channelId: "channel", root };
     await f.runtime.run(f.delivery("@Codex ordinary"));
     await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
@@ -7009,21 +7010,58 @@ describe("gateway turns", () => {
     expect(
       headersOf(methods(f, "thread/resume").at(-1))?.["x-gw-launcher-session"],
     ).toBe(headersOf(resumed)?.["x-gw-launcher-session"]);
-    await finish(f);
-    await vi.waitFor(() =>
-      expect(f.runtime.sessionState(agent, place)).toBe("idle"),
-    );
-    move({
-      kind: "blocked",
-      revision: 3,
-      gatewayOrigin: "https://gateway.test",
-      reason: "network",
-      message: "unreachable",
-    });
-    await expect(f.runtime.session(agent, place, "compact")).rejects.toThrow(
-      "Couldn't compact through the agent gateway",
-    );
+    await f.complete();
   });
+
+  it.each([
+    ["blocked", "network", "Buzz couldn't reach the gateway"],
+    ["pending", "readiness_pending", undefined],
+  ] as const)(
+    "compacts as configured, without the context, while the route is %s",
+    async (_name, reason, detail) => {
+      const { f, gatewayed, agent, move } = routed();
+      const place = { channelId: "channel", root };
+      await f.runtime.run(gatewayed("@Codex routed"));
+      await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+      await finish(f);
+      await vi.waitFor(() =>
+        expect(f.runtime.sessionState(agent, place)).toBe("idle"),
+      );
+      const blocked: GatewayRoute = {
+        kind: "blocked",
+        revision: 2,
+        gatewayOrigin: "https://gateway.test",
+        reason,
+        message: "unavailable",
+      };
+      move(blocked);
+      const compacted = f.runtime.session(agent, place, "compact");
+      await vi.waitFor(() =>
+        expect(methods(f, "thread/compact/start")).toHaveLength(1),
+      );
+      const resumed = methods(f, "thread/resume").at(-1);
+      expect(resumed?.params).toMatchObject({ threadId: "thread-1" });
+      expect(configOf(resumed)).not.toHaveProperty(HEADERS);
+      f.emit({
+        method: "turn/started",
+        params: { threadId: "thread-1", turn: { id: "compact" } },
+      });
+      f.emit({
+        method: "turn/completed",
+        params: {
+          threadId: "thread-1",
+          turn: { id: "compact", status: "completed" },
+        },
+      });
+      await expect(compacted).resolves.toBeUndefined();
+      const view = f.runtime.sessions(pubkey).at(-1);
+      expect(view?.status).toBe("Idle");
+      expect(view?.detail).toBe(fallbackNotice(blocked as never));
+      if (detail) expect(view?.detail).toContain(detail);
+      // Its Buzz session is kept for the next gateway turn.
+      expect([...f.storage.values()].join()).toContain("client_session_id");
+    },
+  );
 
   it("runs a watch or timer in a Buzz session of its own", async () => {
     const { f, gatewayed } = routed();
