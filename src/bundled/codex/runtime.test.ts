@@ -113,6 +113,11 @@ function fixture(
   const failures = new Map<string, string>();
   /** Methods the server answers only once their promise settles. */
   const held = new Map<string, Promise<void>>();
+  /** The turn each thread is running, as Codex tracks it: a `turn/start` on a
+   * thread with one steers its input into that turn. */
+  const live = new Map<string, string>();
+  /** The turn each `turn/start` was answered with. */
+  const answers = new Map<Wire, string>();
   const toolCalls = new Map<
     number | string,
     { threadId: string | undefined; turnId: string; callId: string }
@@ -213,9 +218,15 @@ function fixture(
         result = { thread: { id: `thread-${++thread}`, cwd: params.cwd } };
       if (request.method === "thread/resume")
         result = { thread: { id: params.threadId, cwd: params.cwd } };
-      // Ids follow `complete`'s index, so a refused start still takes one.
-      if (request.method === "turn/start")
-        result = { turn: { id: `turn-${starts().indexOf(request) + 1}` } };
+      // New turns' ids follow `complete`'s index, so a refused start still
+      // takes one. A thread with a running turn takes the input into it.
+      if (request.method === "turn/start") {
+        const thread = String(params.threadId);
+        const id = live.get(thread) ?? `turn-${starts().indexOf(request) + 1}`;
+        live.set(thread, id);
+        answers.set(request, id);
+        result = { turn: { id } };
+      }
       if (request.method === "turn/interrupt")
         emit({
           method: "turn/completed",
@@ -306,8 +317,16 @@ function fixture(
     options = value;
     return process;
   });
-  const emit = (value: Wire) =>
+  const emit = (value: Wire) => {
+    const p = value.params as
+      | { threadId?: string; turn?: { id: string } }
+      | undefined;
+    if (p?.threadId && value.method === "turn/started" && p.turn)
+      live.set(p.threadId, p.turn.id);
+    if (p?.threadId && value.method === "turn/completed")
+      live.delete(p.threadId);
     options?.onStdout?.(`${JSON.stringify(value)}\n`);
+  };
   const publish = vi.fn(async (event: unknown) => ({
     ...(event as object),
     id: "d".repeat(64),
@@ -566,6 +585,9 @@ function fixture(
     } as unknown as Parameters<typeof apply>[0]);
   }
   const starts = () => sent.filter((wire) => wire.method === "turn/start");
+  /** The turn the `index`th start was answered with. */
+  const turnOf = (index: number) =>
+    answers.get(starts()[index] as Wire) ?? `turn-${index + 1}`;
   const interrupt = () => {
     const index = starts().length - 1;
     const params = starts()[index]?.params as { threadId: string };
@@ -573,7 +595,7 @@ function fixture(
       method: "turn/completed",
       params: {
         threadId: params.threadId,
-        turn: { id: `turn-${index + 1}`, status: "interrupted" },
+        turn: { id: turnOf(index), status: "interrupted" },
       },
     });
   };
@@ -589,13 +611,13 @@ function fixture(
       starts()[index]?.params as { threadId: string } | undefined
     )?.threadId;
     const id = `tool-${++toolId}`;
-    toolCalls.set(id, { threadId, turnId: `turn-${index + 1}`, callId: id });
+    toolCalls.set(id, { threadId, turnId: turnOf(index), callId: id });
     emit({
       id,
       method: "item/tool/call",
       params: {
         threadId,
-        turnId: `turn-${index + 1}`,
+        turnId: turnOf(index),
         namespace: "buzz",
         callId: id,
         tool: name,
@@ -626,7 +648,7 @@ function fixture(
       method: "turn/completed",
       params: {
         threadId: params.threadId,
-        turn: { id: `turn-${index + 1}`, status: "completed" },
+        turn: { id: turnOf(index), status: "completed" },
       },
     });
   };
