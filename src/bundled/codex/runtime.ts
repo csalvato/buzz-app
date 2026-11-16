@@ -178,6 +178,8 @@ type Active = {
   tools: AbortController;
   /** Every request this turn has taken in, the first and each steered one. */
   requests: Request[];
+  /** How the turn ended, for a request Codex's answer adds after it did. */
+  settle?: (request: Request) => void;
   /** Latest acknowledged mention per Buzz thread; independent of session scope. */
   activity: Map<string, Request>;
 };
@@ -3020,6 +3022,11 @@ export class CodexRuntime {
     );
     let joined = false;
     let explain: (() => string | undefined) | undefined;
+    /** Ends each request the turn took in, and any Codex adds later. */
+    const end = (settle: (taken: Request) => void) => {
+      active.settle = settle;
+      for (const taken of active.requests) settle(taken);
+    };
     /** Waits for the running turn to end, and runs as the next one. */
     const alone = async () => {
       if (!base) return;
@@ -3153,7 +3160,7 @@ export class CodexRuntime {
             throw error;
           });
         // Codex steered the message into the turn that was running, which
-        // may have ended before its answer was read.
+        // may have ended before its answer was read: it ends as that did.
         if (base && turn.turn.id === base.turnId) {
           base.reply = request;
           base.requests.push(request);
@@ -3164,7 +3171,7 @@ export class CodexRuntime {
           active.requests = [];
           ready();
           placed();
-          if (base.finished) void base.released.then(() => request.answered());
+          base.settle?.(request);
           return;
         }
         active.turnId = turn.turn.id;
@@ -3230,12 +3237,11 @@ export class CodexRuntime {
       // A message that began the next turn has taken over the lane's status.
       const mine = () => lane.active === active;
       if (status === "interrupted" && active.stopped) {
-        for (const taken of active.requests) taken.answered(true);
+        end((taken) => taken.answered(true));
         await this.terminals(rpc, active.threadId, STOP_LINGER_MS);
         if (mine()) this.status(agent.key, key, "Stopped");
       } else if (status === "interrupted") {
-        for (const taken of active.requests)
-          taken.failActivity("Codex’s turn was interrupted");
+        end((taken) => taken.failActivity("Codex’s turn was interrupted"));
         await this.terminals(rpc, active.threadId);
         await this.publish(
           active.reply,
@@ -3248,7 +3254,7 @@ export class CodexRuntime {
         )?.finalDelivery;
         if (failed instanceof Error) throw failed;
         // A turn may end without a reply when there is nothing new to say.
-        for (const taken of active.requests) taken.answered();
+        end((taken) => taken.answered());
         if (mine()) this.status(agent.key, key, "Idle");
       }
     } catch (error) {
@@ -3256,12 +3262,13 @@ export class CodexRuntime {
       if (error instanceof Refused && !active.turnId) restoreNotes(request);
       // Failing to join a turn leaves that turn running.
       const steering = base && !base.finished;
-      for (const taken of active.requests)
+      end((taken) =>
         taken.failActivity(
           steering
             ? `Steering was not accepted: ${message(error)}`
             : message(error),
-        );
+        ),
+      );
       const ended = active.finished;
       active.finished = true;
       notReady(error);

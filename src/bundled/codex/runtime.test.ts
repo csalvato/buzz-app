@@ -2566,6 +2566,38 @@ it("sends a message whose history read outlasts the running turn as a turn/start
     f.publish.mock.calls.map(([event]) => (event as EventData).content),
   ).toEqual(["FIRST", "SECOND"]);
 });
+it("settles a message steered into a stopped turn as stopped when its answer comes during the stop", async () => {
+  const f = fixture();
+  const interruptible = vi.fn<NonNullable<Delivery["interruptible"]>>();
+  await f.runtime.run({ ...f.delivery("first"), interruptible });
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  f.held.set("turn/start", new Promise(() => undefined));
+  await f.runtime.run(f.delivery("steered"));
+  const sent = () => f.sent.filter((wire) => wire.method === "turn/start");
+  await vi.waitFor(() => expect(sent()).toHaveLength(2));
+  f.held.set("turn/interrupt", new Promise(() => undefined));
+  void interruptible.mock.calls[0]?.[0]?.();
+  await vi.waitFor(() =>
+    expect(f.sent.some((wire) => wire.method === "turn/interrupt")).toBe(true),
+  );
+  f.emit({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "interrupted" },
+    },
+  });
+  await expect(f.workingUntil.mock.calls[0]?.[0]).resolves.toEqual({
+    ok: true,
+    stopped: true,
+  });
+  // Codex took the message into the turn before it stopped.
+  f.emit({ id: sent()[1]?.id ?? 0, result: { turn: { id: "turn-1" } } });
+  await expect(f.workingUntil.mock.calls[1]?.[0]).resolves.toEqual({
+    ok: true,
+    stopped: true,
+  });
+});
 it("starts its own turn for a message whose turn the owner stopped while its history was read", async () => {
   const f = fixture();
   const interruptible = vi.fn<NonNullable<Delivery["interruptible"]>>();
