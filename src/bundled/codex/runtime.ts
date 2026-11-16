@@ -2776,12 +2776,21 @@ export class CodexRuntime {
     }
     const added = this.added();
     const tools = addedKey(added);
-    const print = JSON.stringify([
-      workspace,
-      tools,
-      agent.protection?.stateKey,
-      { ...params, model: undefined },
-    ]);
+    // Codex lists config/read's servers in no fixed order, so keys are sorted.
+    const print = JSON.stringify(
+      [
+        workspace,
+        tools,
+        agent.protection?.stateKey,
+        { ...params, model: undefined },
+      ],
+      (_, v) =>
+        v && typeof v === "object" && !Array.isArray(v)
+          ? Object.fromEntries(
+              Object.entries(v).sort(([a], [b]) => (a < b ? -1 : +(a > b))),
+            )
+          : v,
+    );
     return {
       workspace,
       saved,

@@ -91,6 +91,7 @@ function fixture(
     model_reasoning_effort?: string;
     model_reasoning_summary?: string;
     features?: { hooks?: boolean; codex_hooks?: boolean };
+    mcp_servers?: Record<string, Record<string, unknown>>;
   } = {},
   repositories?: (scope: string | undefined) => string,
   hooks?: ConstructorParameters<typeof CodexRuntime>[7],
@@ -206,7 +207,7 @@ function fixture(
         result = {
           config: {
             ...configured,
-            mcp_servers: {
+            mcp_servers: configured.mcp_servers ?? {
               "company.tools": {
                 command: "secret-tool",
                 enabled: true,
@@ -2302,6 +2303,22 @@ it("asks for reasoning summaries on a turn of a thread left open", async () => {
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
   expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(false);
   expect(f.starts()[1]?.params).toMatchObject({ summary: "auto" });
+});
+it("keeps a thread open when Codex lists the same servers in another order", async () => {
+  const configured: { mcp_servers?: Record<string, Record<string, unknown>> } =
+    { mcp_servers: { a: { command: "a" }, b: { command: "b" } } };
+  const f = fixture([], undefined, false, configured);
+  await f.runtime.run(f.delivery("@Codex first"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  await f.complete(0, "FIRST");
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  configured.mcp_servers = { b: { command: "b" }, a: { command: "a" } };
+  await f.runtime.run(f.delivery("@Codex second"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  expect(f.sent.some((wire) => wire.method === "thread/unsubscribe")).toBe(
+    false,
+  );
+  await f.complete(1, "SECOND");
 });
 it("reopens a thread left open when what it opens with changes", async () => {
   const f = fixture();
