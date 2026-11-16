@@ -37,8 +37,9 @@ export const STOP_TIMEOUT_MS = 5_000;
 const STDERR_LIMIT = 4_000;
 
 /** What a resumed session runs on, as far as Buzz knows: no provider a
- * choice names, so a harness's `select` reapplies the choice's. */
-const SAVED: Choice = { provider: "\u0000saved", model: "" };
+ * choice names, so a harness's `select` reapplies the choice's. Its model is
+ * unknown too: whatever the session was saved on. */
+export const SAVED: Choice = { provider: "\u0000saved", model: "" };
 
 /** Never reaches a harness, whatever its hooks or launch say: its Buzz tools
  * come over HTTP MCP, never a Buzz key. */

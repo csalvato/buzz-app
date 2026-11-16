@@ -82,7 +82,7 @@ import {
   type Settled,
   type ToolServer,
 } from "./goose";
-import { forwardedTurn } from "./forwarded";
+import { forwardedTurn, GATEWAY_PROVIDER } from "./forwarded";
 import { marked, unforged } from "./transcript";
 import {
   absolute,
@@ -160,6 +160,9 @@ type Entry = {
    * which retiring the agent ends and waits for; one whose retirement failed
    * stays. */
   retiring: Set<Owned>;
+  /** Forwarded turns running, by conversation, for its status view: their
+   * sessions run outside `sessions`. */
+  forwarding: Map<string, Readonly<{ sessionId?: string; at: number }>>;
   config: Config;
   /** The team sections of the latest run; a change reopens idle sessions. */
   team: string;
@@ -349,7 +352,22 @@ export class GooseRuntime {
   sessions(agent: AgentKey) {
     let view = this.views.get(agent);
     if (!view) {
-      view = this.agents.get(agent)?.sessions.snapshot() ?? [];
+      const entry = this.agents.get(agent);
+      const forwarded = [...(entry?.forwarding ?? [])].map(
+        ([key, { sessionId, at }]) => ({
+          key,
+          busy: true,
+          ...(sessionId ? { sessionId } : {}),
+          at,
+        }),
+      );
+      // A forwarded turn holds its conversation, so it stands for it.
+      view = [
+        ...(entry?.sessions.snapshot() ?? []).filter(
+          (row) => !entry?.forwarding.has(row.key),
+        ),
+        ...forwarded,
+      ];
       this.views.set(agent, view);
     }
     return view;
@@ -898,6 +916,16 @@ export class GooseRuntime {
     // retirement after.
     const owned: Owned = { ended: Promise.resolve() };
     entry.retiring.add(owned);
+    // Working until it settles, on the session it resumes or opens. The
+    // conversation's next turn may start once this one's process exits,
+    // before it settles, so it clears only its own row.
+    let row: Readonly<{ sessionId?: string; at: number }> | undefined;
+    const running = (sessionId = held?.saved) => {
+      row = { ...(sessionId ? { sessionId } : {}), at: Date.now() };
+      entry.forwarding.set(key, row);
+      this.notify();
+    };
+    running();
     // What the prompt sent was built to have shown, noted once goose takes
     // it, as an ordinary message is.
     let shown: number | undefined;
@@ -938,7 +966,8 @@ export class GooseRuntime {
         },
         ...(held ? { keep: (id: string) => held.keep(id, binding) } : {}),
         // Kept as an ordinary new session's is, for the Prompts tab.
-        started: (id) =>
+        started: (id) => {
+          running(id);
           void this.prompts(agent).save(
             id,
             [{ label: "", text: systemPrompt }],
@@ -947,7 +976,8 @@ export class GooseRuntime {
               title: turn.title ?? "",
               conversation: held ? key : null,
             },
-          ),
+          );
+        },
         outlives: (retirement, exited) => {
           // Before the turn ends: by then, one whose process exited is
           // confirmed retired or failed.
@@ -981,6 +1011,12 @@ export class GooseRuntime {
       CHANGED,
     );
     owned.ended = done;
+    const cleared = () => {
+      if (entry.forwarding.get(key) !== row) return;
+      entry.forwarding.delete(key);
+      this.notify();
+    };
+    void done.then(cleared, cleared);
     // Ended with nothing left running: nothing more to wait for.
     void done.then(
       () => {
@@ -1177,6 +1213,7 @@ export class GooseRuntime {
       sessions: undefined as unknown as AgentSessions,
       tools: undefined as unknown as ToolServer,
       retiring: new Set(),
+      forwarding: new Map(),
       contexts: new Map(),
       policies: new Map(),
     };
@@ -1347,9 +1384,6 @@ type ForwardTurn = Readonly<{
   kept?: string;
 }>;
 
-/** The provider goose forwards through: the gateway serves Databricks'
- * API. */
-const GATEWAY_PROVIDER = "databricks";
 const NOT_COMPACTED =
   "Couldn't compact: this conversation's session ran through the agent gateway, which this agent's turns don't use now.";
 /** goose's error for held work it never ran. */

@@ -212,12 +212,17 @@ export async function forwardedTurn(
 
 const noop = () => {};
 
-/** Pins a delegate's provider and model to the turn's. */
+/** The provider goose forwards through: the gateway serves Databricks'
+ * API. */
+export const GATEWAY_PROVIDER = "databricks";
+
+/** Pins a delegate to the gateway's provider, which a forwarded turn runs on
+ * whether the agent names it or inherits goose's default, and to the turn's
+ * model when it names one. */
 function subagent(turn: ForwardedTurn): Record<string, string> {
-  const { provider, model } = turn.choice();
-  const chosen = turn.model || model;
+  const chosen = turn.model || turn.choice().model;
   return {
-    ...(provider ? { GOOSE_SUBAGENT_PROVIDER: provider } : {}),
+    GOOSE_SUBAGENT_PROVIDER: GATEWAY_PROVIDER,
     ...(chosen ? { GOOSE_SUBAGENT_MODEL: chosen } : {}),
   };
 }

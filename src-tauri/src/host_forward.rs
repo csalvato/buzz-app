@@ -143,6 +143,10 @@ impl Harness {
             {
                 Some(Class::Inference)
             }
+            // A Responses model's turn names its model in the body, not the path.
+            (Harness::Goose, &Method::POST, ["serving-endpoints", "responses"], None) => {
+                Some(Class::Inference)
+            }
             _ => None,
         }
     }

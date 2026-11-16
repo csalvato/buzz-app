@@ -1750,3 +1750,12 @@ async fn children_and_calls_have_their_own_bounds() {
     );
     assert_eq!(sizes(&forward), (CALL_CAP, CHILD_CAP));
 }
+
+#[test]
+fn goose_responses_route_is_inference() {
+    // Pinned goose v1.57.0 posts Responses models here (databricks.rs stream()).
+    assert_eq!(
+        Harness::Goose.classify(&Method::POST, "/serving-endpoints/responses", None),
+        Some(Class::Inference)
+    );
+}

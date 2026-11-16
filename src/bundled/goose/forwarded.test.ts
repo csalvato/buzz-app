@@ -201,9 +201,23 @@ describe("a forwarded goose turn", () => {
     ]);
   });
 
+  it("pins a delegate to the gateway's provider when the agent inherits goose's default", async () => {
+    const { fake, run } = setup(
+      {},
+      { choice: () => ({ provider: "", model: "" }) },
+    );
+    await expect(run()).resolves.toMatchObject({ ok: true });
+    expect(fake.geese[0]?.env).toMatchObject({
+      GOOSE_SUBAGENT_PROVIDER: "databricks",
+    });
+  });
+
   it("resumes the saved session it is given, never a new one", async () => {
     const started = vi.fn();
-    const { fake, order, run } = setup({}, { load: "s-saved", started });
+    const { fake, order, run } = setup(
+      { providers: [{ providerId: "databricks", defaultModel: "db-default" }] },
+      { load: "s-saved", started },
+    );
     await expect(run()).resolves.toMatchObject({ ok: true });
     const [goose] = fake.geese;
     expect(goose?.loaded).toEqual(["s-saved"]);
@@ -211,12 +225,37 @@ describe("a forwarded goose turn", () => {
     expect(started).not.toHaveBeenCalled();
     expect(goose?.opened).toEqual([]);
     // Put back on the gateway's provider, whatever it was saved with.
-    expect(goose?.configured).toEqual(["s-saved provider=databricks"]);
+    expect(goose?.configured).toEqual([
+      "s-saved provider=databricks",
+      "s-saved model=db-default",
+    ]);
     expect(goose?.prompts.get("s-saved")).toBe("prompt");
     expect(order.slice(0, 3)).toEqual([
       "keep s-saved",
       "associate s-saved",
       "prompt false",
+    ]);
+  });
+
+  it("puts a resumed session with no pick back on its provider's default model, whatever it was saved on", async () => {
+    const { fake, run } = setup(
+      { providers: [{ providerId: "databricks", defaultModel: "db-default" }] },
+      { load: "s-saved" },
+    );
+    await expect(run()).resolves.toMatchObject({ ok: true });
+    // goose keeps a saved model when its provider is set again unchanged.
+    expect(fake.geese[0]?.configured).toEqual([
+      "s-saved provider=databricks",
+      "s-saved model=db-default",
+    ]);
+    // A pick, or goose's own default provider, needs no second switch.
+    await expect(run({ model: "m-turn" })).resolves.toMatchObject({ ok: true });
+    await expect(
+      run({ choice: () => ({ provider: "", model: "" }) }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(fake.geese.slice(1).map((goose) => goose.configured)).toEqual([
+      ["s-saved provider=databricks", "s-saved model=m-turn"],
+      ["s-saved provider=goose"],
     ]);
   });
 

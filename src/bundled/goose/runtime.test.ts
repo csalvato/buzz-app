@@ -108,6 +108,8 @@ function setup(
   const fake = fakeSpawn({
     hold: options.hold ?? false,
     load: true,
+    // As goose lists it: a resumed session is put back on its default.
+    providers: [{ providerId: "databricks", defaultModel: "db-default" }],
     ...(options.protection && {
       history: [
         {
@@ -2472,6 +2474,28 @@ describe("goose turns through the agent gateway", () => {
       expect(prompts.get("session-1")).toEqual([
         { label: "", text: expect.stringContaining("Buzz") },
       ]);
+    } finally {
+      f.runtime.dispose();
+    }
+  });
+
+  it("shows a forwarded turn working in the Activity snapshot until it settles", async () => {
+    const g = gateway();
+    const f = setup({
+      forwarding: g.forwarding,
+      provider: "databricks",
+      hold: true,
+    });
+    try {
+      f.runtime.subscribe(() => void f.runtime.sessions(self));
+      await f.deliver(root, dispatched());
+      await vi.waitFor(() => expect(f.fake.geese[0]?.turns).toHaveLength(1));
+      expect(f.runtime.sessions(self)).toMatchObject([
+        { key, busy: true, sessionId: "session-1" },
+      ]);
+      f.fake.geese[0]?.turns[0]?.finish();
+      await vi.waitFor(() => expect(g.calls).toContain("close 1"));
+      expect(f.runtime.sessions(self).filter((row) => row.busy)).toEqual([]);
     } finally {
       f.runtime.dispose();
     }
