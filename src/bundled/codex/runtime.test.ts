@@ -3441,6 +3441,37 @@ it("takes a plugin's wake in its thread's conversation, as the plugin's and not 
   expect(input).not.toContain("<buzz-event");
   expect(input).not.toContain(WAKE_ID);
 });
+it("tells listeners the session is idle when a wake waiting for its own turn is no longer current", async () => {
+  const f = fixture();
+  const first = f.delivery("first");
+  const agent = { ...first.agent, config: first.config } as unknown as Agent;
+  const place = { channelId: "channel", root };
+  await f.runtime.run(first);
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  let wanted = true;
+  // A different model waits for a turn of its own.
+  await f.runtime.run({
+    ...pluginWake(f, root),
+    model: f.modelIds[1],
+    current: () => wanted,
+  });
+  await vi.waitFor(() =>
+    expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Starting"),
+  );
+  const seen: string[] = [];
+  f.runtime.subscribe(() =>
+    seen.push(
+      `${f.runtime.sessions(pubkey)[0]?.status}/${f.runtime.sessionState(agent, place)}`,
+    ),
+  );
+  wanted = false;
+  await f.complete(0, "FIRST");
+  await expect(f.workingUntil.mock.calls[1]?.[0]).resolves.toEqual({
+    ok: true,
+  });
+  await vi.waitFor(() => expect(seen.at(-1)).toBe("Idle/idle"));
+  expect(f.starts()).toHaveLength(1);
+});
 it("keeps a wake's text from posing as the turn's event", async () => {
   const f = fixture();
   const delivery = pluginWake(f, root);

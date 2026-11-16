@@ -1950,6 +1950,8 @@ export class CodexRuntime {
           )
           .finally(() => {
             current.pending--;
+            // A message that ran no turn leaves the lane as it found it.
+            if (!busy(current)) void this.rest(entry, key, current);
           });
       },
     );
@@ -2242,6 +2244,7 @@ export class CodexRuntime {
     entry: Entry,
   ) {
     let base: Active | undefined;
+    let waited = false;
     for (;;) {
       const active = lane.active;
       // A server-started voice turn can arrive while this one waits.
@@ -2251,6 +2254,7 @@ export class CodexRuntime {
         break;
       }
       this.status(request.agent.key, key, "Starting");
+      waited = true;
       if (active) await active.released;
       else {
         await lane.tail.catch(() => undefined);
@@ -2265,6 +2269,7 @@ export class CodexRuntime {
     }
     if (!base && request.current && !request.current()) {
       request.answered();
+      if (waited) this.status(request.agent.key, key, "Idle");
       return;
     }
     let placed!: () => void;
