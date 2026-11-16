@@ -415,22 +415,29 @@ pub fn agent_gateway() -> Option<&'static gateway::Native> {
         })
         .as_ref()
 }
-fn agent_gateway_origin() -> &'static str {
-    agent_gateway().map_or("", |gateway| gateway.gateway.as_str())
-}
-/// The bundled Agents plugin, which may reach the agent gateway for its
-/// access check: that origin and nothing more.
-fn agents_manifest(gateway: &str) -> Manifest {
-    let mut agents: Manifest =
-        serde_json::from_str(include_str!("../../../src/bundled/agents/manifest.json"))
-            .expect("agents manifest");
-    if !gateway.is_empty() {
-        let host = agents.host.as_mut().expect("agents host grants");
-        host.network_origins.push(gateway.into());
+/// The bundled plugins that reach this build's agent gateway, and only its
+/// origin: the Agents plugin for its access check, and a harness plugin whose
+/// upstream native forwarding has, to open its generations.
+fn gateway_grant(mut manifest: Manifest, gateway: Option<&gateway::Native>) -> Manifest {
+    let Some(gateway) = gateway else {
+        return manifest;
+    };
+    let reaches = match manifest.id.as_str() {
+        "buzz.agents" => true,
+        "buzz.claude-code" => gateway.upstreams.contains_key("claude-code"),
+        "buzz.goose" => gateway.upstreams.contains_key("goose"),
+        _ => false,
+    };
+    if reaches {
+        let host = manifest.host.get_or_insert_with(Default::default);
+        host.network_origins.push(gateway.gateway.clone());
     }
-    agents
+    manifest
 }
 pub fn bundled_manifests() -> Vec<Manifest> {
+    bundled_manifests_for(agent_gateway())
+}
+fn bundled_manifests_for(gateway: Option<&gateway::Native>) -> Vec<Manifest> {
     let mut builderlab: Manifest = serde_json::from_str(include_str!(
         "../../../src/bundled/builderlab/manifest.json"
     ))
@@ -509,7 +516,8 @@ pub fn bundled_manifests() -> Vec<Manifest> {
             .expect("usage manifest"),
         serde_json::from_str(include_str!("../../../src/bundled/repos/manifest.json"))
             .expect("projects manifest"),
-        agents_manifest(agent_gateway_origin()),
+        serde_json::from_str(include_str!("../../../src/bundled/agents/manifest.json"))
+            .expect("agents manifest"),
         serde_json::from_str(include_str!("../../../src/bundled/watching/manifest.json"))
             .expect("watching manifest"),
         serde_json::from_str(include_str!(
@@ -547,6 +555,9 @@ pub fn bundled_manifests() -> Vec<Manifest> {
         serde_json::from_str(include_str!("../../../src/bundled/focus/manifest.json"))
             .expect("focus manifest"),
     ]
+    .into_iter()
+    .map(|manifest| gateway_grant(manifest, gateway))
+    .collect()
 }
 /// New bundles must opt in to the default-on policy.
 fn enabled_by_default(id: &str) -> bool {
@@ -878,6 +889,8 @@ pub struct Manager {
     profile: String,
     safe_mode: bool,
     existing_profile: bool,
+    /// This build's agent gateway, which bundled grants follow.
+    gateway: Option<&'static gateway::Native>,
 }
 impl Manager {
     /// Host control-plane location that protected workers must not modify.
@@ -903,6 +916,7 @@ impl Manager {
             profile: profile.into(),
             safe_mode,
             existing_profile,
+            gateway: agent_gateway(),
         })
     }
     /// Opens the environment's plugin home, else `home`: the desktop passes its own app data folder.
@@ -1017,7 +1031,7 @@ impl Manager {
     }
     pub fn catalog(&self) -> Result<Catalog> {
         let registry = self.lock().and_then(|_lock| self.read())?;
-        let mut plugins: Vec<PluginInfo> = bundled_manifests()
+        let mut plugins: Vec<PluginInfo> = bundled_manifests_for(self.gateway)
             .into_iter()
             .map(|manifest| {
                 // Required even when an older profile saved a disabled override.
@@ -2486,27 +2500,132 @@ mod tests {
     }
 
     #[test]
-    fn agents_reach_only_the_agent_gateway_origin() {
-        assert!(super::agents_manifest("")
-            .host
-            .unwrap()
-            .network_origins
-            .is_empty());
-        let host = super::agents_manifest("https://gateway.example")
-            .host
-            .unwrap();
-        assert_eq!(host.network_origins, ["https://gateway.example"]);
-        assert!(host.mcp && host.files && host.federated_identity.is_none());
+    fn only_agents_and_configured_harnesses_reach_the_agent_gateway_origin() {
+        let descriptor = |upstreams: serde_json::Value| {
+            let raw = serde_json::json!({
+                "version": 2,
+                "gateway": "https://gateway.example",
+                "communities": [
+                    { "id": "22222222-2222-4222-8222-222222222222", "origin": "wss://relay.example" }
+                ],
+                "access_path": "/v9/access",
+                "launcher_client": "client-a",
+                "headers": {
+                    "launcher_client": "x-gw-launcher-client",
+                    "launcher_session": "x-gw-launcher-session",
+                    "human_pubkey": "x-gw-ctx-human-pubkey",
+                    "agent_pubkey": "x-gw-ctx-agent-pubkey",
+                    "community_id": "x-gw-ctx-community-id",
+                    "channel_id": "x-gw-ctx-channel-id",
+                    "message_id": "x-gw-ctx-message-id",
+                    "thread_id": "x-gw-ctx-thread-id"
+                },
+                "reserved_prefixes": ["x-gw-ctx-"],
+                "upstreams": upstreams
+            });
+            let (native, _) = super::gateway::parse(&raw.to_string()).unwrap().unwrap();
+            &*Box::leak(Box::new(native))
+        };
+        let both = descriptor(serde_json::json!({
+            "claude-code": { "base": "/upstream/claude" },
+            "goose": { "base": "/upstream/goose" },
+            "pi": { "base": "/upstream/pi" }
+        }));
+        let claude = descriptor(serde_json::json!({
+            "claude-code": { "base": "/upstream/claude" },
+            "pi": { "base": "/upstream/pi" }
+        }));
+        let goose = descriptor(serde_json::json!({
+            "goose": { "base": "/upstream/goose" }
+        }));
+        let pi = descriptor(serde_json::json!({
+            "pi": { "base": "/upstream/pi" }
+        }));
         let temp = tempfile::tempdir().unwrap();
-        let manager = Manager::open(Some(temp.path().into()), "test", false).unwrap();
-        let grants = manager.host_grants("buzz.agents", "bundled").unwrap();
+        let opened = Manager::open(Some(temp.path().into()), "test", false).unwrap();
+        opened.change("enable", "buzz.pi").unwrap();
+        let origins = |gateway: Option<&'static super::gateway::Native>, id: &str| {
+            let manager = Manager {
+                gateway,
+                ..opened.clone()
+            };
+            manager.host_grants(id, "bundled").unwrap().network_origins
+        };
+        let gateway = "https://gateway.example";
+        let claude_own = "https://downloads.claude.ai";
+        let codex_own = "https://releases.openai.com";
+        // An unconfigured build grants as each manifest declares.
+        assert!(origins(None, "buzz.agents").is_empty());
+        assert_eq!(origins(None, "buzz.claude-code"), [claude_own]);
+        assert!(origins(None, "buzz.goose").is_empty());
+        // Agents and each harness with a forwarded upstream gain the origin.
+        assert_eq!(origins(Some(both), "buzz.agents"), [gateway]);
         assert_eq!(
-            grants.network_origins,
-            if super::agent_gateway_origin().is_empty() {
-                vec![]
-            } else {
-                vec![super::agent_gateway_origin().to_owned()]
+            origins(Some(both), "buzz.claude-code"),
+            [claude_own, gateway]
+        );
+        assert_eq!(origins(Some(both), "buzz.goose"), [gateway]);
+        assert_eq!(
+            origins(Some(claude), "buzz.claude-code"),
+            [claude_own, gateway]
+        );
+        assert!(origins(Some(claude), "buzz.goose").is_empty());
+        assert_eq!(origins(Some(goose), "buzz.claude-code"), [claude_own]);
+        assert_eq!(origins(Some(goose), "buzz.goose"), [gateway]);
+        assert_eq!(origins(Some(pi), "buzz.claude-code"), [claude_own]);
+        assert!(origins(Some(pi), "buzz.goose").is_empty());
+        // No other plugin does.
+        for gateway in [both, claude, goose, pi] {
+            assert_eq!(origins(Some(gateway), "buzz.codex"), [codex_own]);
+            assert!(origins(Some(gateway), "buzz.pi").is_empty());
+            assert!(origins(Some(gateway), "buzz.channels").is_empty());
+            let manager = Manager {
+                gateway: Some(gateway),
+                ..opened.clone()
+            };
+            // Every other grant is the manifest's own.
+            for id in ["buzz.agents", "buzz.claude-code", "buzz.goose"] {
+                let granted = manager.host_grants(id, "bundled").unwrap();
+                let declared = Manager {
+                    gateway: None,
+                    ..opened.clone()
+                }
+                .host_grants(id, "bundled")
+                .unwrap();
+                assert_eq!(
+                    super::HostGrants {
+                        network_origins: declared.network_origins.clone(),
+                        ..granted
+                    },
+                    declared
+                );
             }
+            // A harness id is never an artifact's to claim.
+            for id in ["buzz.claude-code", "buzz.goose"] {
+                assert!(manager.host_grants(id, &"a".repeat(64)).is_err());
+            }
+        }
+        // A disabled harness has no grants at all.
+        let manager = Manager {
+            gateway: Some(both),
+            ..opened.clone()
+        };
+        for id in ["buzz.claude-code", "buzz.goose"] {
+            opened.change("disable", id).unwrap();
+            assert!(manager.host_grants(id, "bundled").is_err());
+            opened.change("enable", id).unwrap();
+            assert!(manager
+                .host_grants(id, "bundled")
+                .unwrap()
+                .network_origins
+                .contains(&gateway.to_owned()));
+        }
+        // The build's own gateway is what `open` uses.
+        assert_eq!(
+            Manager::open(Some(temp.path().into()), "test", false)
+                .unwrap()
+                .gateway,
+            super::agent_gateway()
         );
     }
 
