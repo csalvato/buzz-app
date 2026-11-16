@@ -3189,6 +3189,13 @@ export class CodexRuntime {
             if (!entry.abort.signal.aborted)
               console.warn("Codex could not title the chat", error);
           });
+        // The turn Codex took in is what later ones on this thread continue.
+        if (lane.open?.loaded.threadId === threadId)
+          lane.open.loaded = {
+            ...lane.open.loaded,
+            fresh: false,
+            resuming: true,
+          };
         // Empty threads have no resumable rollout until a user turn is accepted.
         await this.save(request, entry, key, {
           threadId,
@@ -3199,13 +3206,6 @@ export class CodexRuntime {
             ? { protection: agent.protection.stateKey }
             : {}),
         });
-        // The turn Codex took in is what later ones on this thread continue.
-        if (lane.open?.loaded.threadId === threadId)
-          lane.open.loaded = {
-            ...lane.open.loaded,
-            fresh: false,
-            resuming: true,
-          };
         ready();
         placed();
         this.status(agent.key, key, "Working");

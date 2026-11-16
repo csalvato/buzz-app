@@ -7435,6 +7435,56 @@ it("retries a refused first turn but requires New when an accepted remote rollou
   );
 });
 
+it("keeps the binding of a thread whose acceptance failed to save when a later turn on it is refused", async () => {
+  const guest = fixture();
+  const target = guestTarget(guest);
+  const f = fixture(
+    [],
+    undefined,
+    false,
+    {},
+    undefined,
+    undefined,
+    async () => target,
+  );
+  const delivery = f.delivery("first");
+  const agent = {
+    ...delivery.agent,
+    config: delivery.config,
+  } as unknown as Agent;
+  const place = { channelId: "channel", root };
+  const set = f.storage.set.bind(f.storage);
+  let failed = false;
+  vi.spyOn(f.storage, "set").mockImplementation((key, value) => {
+    if (
+      !failed &&
+      key.startsWith("buzz.codex.sessions") &&
+      value.includes("thread-1") &&
+      !value.includes('"pending"')
+    ) {
+      failed = true;
+      throw new Error("Disk full");
+    }
+    return set(key, value);
+  });
+  await f.runtime.run(delivery);
+  await vi.waitFor(() => expect(failed).toBe(true));
+  await guest.complete(0);
+  await vi.waitFor(() =>
+    expect(f.runtime.sessionState(agent, place)).toBe("idle"),
+  );
+  guest.failing.add("turn/start");
+  await f.runtime.run(f.delivery("refused"));
+  await vi.waitFor(() => expect(guest.starts()).toHaveLength(2));
+  await vi.waitFor(() =>
+    expect(f.runtime.sessionState(agent, place)).toBe("idle"),
+  );
+  const bindings = [...f.storage]
+    .filter(([key]) => key.startsWith("buzz.codex.sessions"))
+    .map(([, value]) => value);
+  expect(bindings.join()).toContain("thread-1");
+});
+
 it("resumes the durably saved thread even when the host cache has no thread", async () => {
   const conversation = JSON.stringify(["channel", root]);
   const key = `buzz.codex.sessions.execution.v1:${scope}:${pubkey}:${conversation}`;
