@@ -7013,6 +7013,42 @@ describe("gateway turns", () => {
     await f.complete();
   });
 
+  it("compacts without the context, and says so, when Codex's provider isn't the AI Gateway's", async () => {
+    const providers: ProviderConfig & { model_provider?: string } = {
+      model_provider: PROVIDER,
+      model_providers: { [PROVIDER]: { http_headers: {} } },
+    };
+    const { f, gatewayed, agent } = routed(providers);
+    const place = { channelId: "channel", root };
+    await f.runtime.run(gatewayed("@Codex routed"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    await finish(f);
+    await vi.waitFor(() =>
+      expect(f.runtime.sessionState(agent, place)).toBe("idle"),
+    );
+    providers.model_provider = "openai";
+    const compacted = f.runtime.session(agent, place, "compact");
+    await vi.waitFor(() =>
+      expect(methods(f, "thread/compact/start")).toHaveLength(1),
+    );
+    expect(configOf(methods(f, "thread/resume").at(-1))).not.toHaveProperty(
+      HEADERS,
+    );
+    f.emit({
+      method: "turn/started",
+      params: { threadId: "thread-1", turn: { id: "compact" } },
+    });
+    f.emit({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "compact", status: "completed" },
+      },
+    });
+    await expect(compacted).resolves.toBeUndefined();
+    expect(f.runtime.sessions(pubkey).at(-1)?.detail).toBe(NO_PROVIDER);
+  });
+
   it.each([
     ["blocked", "network", "Buzz couldn't reach the gateway"],
     ["pending", "readiness_pending", undefined],

@@ -676,6 +676,7 @@ export class CodexRuntime {
       const gateway =
         control?.kind === "eligible" ? control.gateway : undefined;
       const headed = this.gatewayParams(prepared, gateway);
+      if (gateway && !headed) notice = this.unheaded();
       try {
         if (gateway && headed) {
           const bound = continueSession(gateway.route, thread.gateway);
