@@ -949,6 +949,7 @@ export class ClaudeRuntime {
       signal,
       step,
       acknowledged,
+      accepted,
       superseded,
       interruptible,
       named,
@@ -1182,6 +1183,7 @@ export class ClaudeRuntime {
               : (threadReference(event)?.rootId ?? event.id),
             ...(step ? { step } : {}),
             ...(acknowledged ? { acknowledged } : {}),
+            ...(accepted ? { accepted } : {}),
             ...(superseded ? { superseded } : {}),
             pick: {
               ...(model ? { model } : {}),
