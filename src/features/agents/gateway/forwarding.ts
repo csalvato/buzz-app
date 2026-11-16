@@ -220,8 +220,6 @@ export class GatewayForwarding {
     turn: Readonly<{
       binding: GatewayBinding;
       context: TurnContext;
-      /** Claude: its spawn session; goose: none, named by `associate`. */
-      session?: string;
     }>,
     signal: AbortSignal,
   ): Promise<Generation> {
@@ -289,7 +287,6 @@ export class GatewayForwarding {
             route: this.key(agent),
             routeRevision: route.revision,
             harness: this.harness.native,
-            ...(turn.session === undefined ? {} : { session: turn.session }),
             inference: inference.value,
             discovery: discovery.value,
             onEvent,

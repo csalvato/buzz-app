@@ -98,6 +98,8 @@ function prompt(
   };
 }
 
+export { withNotices } from "../../features/agents/activity-transcript";
+
 /** Transcript lines as turns, each opened by a prompt. Claude Code's own
  * entries (metadata, subagents, attachments) are left out. */
 export function claudeTurns(

@@ -1,4 +1,4 @@
-//! Loopback forwarding from a local harness (Claude Code, goose) to the
+//! Loopback forwarding from local goose to the
 //! build's agent gateway, with Buzz's context headers composed in natively.
 //! The harness is pointed at a generation's base URL and keeps its own
 //! credentials, bodies, streaming, retries and cancellation; this adds only
@@ -20,8 +20,8 @@
 //!   revokes what opened under an older one, aborting its streams. A request
 //!   is admitted under the same lock that revocation takes.
 //! - Inference must name the generation's harness session in the harness's own
-//!   header. A Claude generation is opened with its session; a goose one opens
-//!   for discovery only and is associated once, before its first prompt.
+//!   header. A generation opens for discovery only and is associated once,
+//!   before its first prompt.
 //! - A goose generation also admits the children its parent session delegates
 //!   to, each registered from a live delegate call that named it.
 //!   Inference naming an unregistered child parks until it is registered, at
@@ -95,7 +95,6 @@ type Reply = Response<BoxBody<Bytes, BoxError>>;
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Harness {
-    Claude,
     Goose,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -111,25 +110,18 @@ impl Harness {
     /// harness under. The IPC name stays the transport's own.
     fn capability(self) -> &'static str {
         match self {
-            Harness::Claude => "claude-code",
             Harness::Goose => "goose",
         }
     }
     fn session_header(self) -> &'static str {
         match self {
-            Harness::Claude => "x-claude-code-session-id",
             Harness::Goose => "agent-session-id",
         }
     }
-    /// What the request is, from the exact routes each harness was observed
-    /// to send (Claude Code 2.1.318, goose-acp 1.57.0).
+    /// What the request is, from the exact routes goose-acp 1.57.0 sends.
     fn classify(self, method: &Method, path: &str, query: Option<&str>) -> Option<Class> {
         let segments: Vec<&str> = path.strip_prefix('/')?.split('/').collect();
         match (self, method, segments.as_slice(), query) {
-            (Harness::Claude, &Method::HEAD, ["api", "hello"], None) => Some(Class::Discovery),
-            (Harness::Claude, &Method::POST, ["v1", "messages"], None | Some("beta=true")) => {
-                Some(Class::Inference)
-            }
             (Harness::Goose, &Method::GET, ["api", "2.0", "serving-endpoints"], None) => {
                 Some(Class::Discovery)
             }
@@ -493,12 +485,9 @@ impl HostForward {
         if !opaque(route) {
             return Err("Invalid route".into());
         }
-        // A Claude process is spawned on its session; goose learns its own
-        // and is associated once it has one.
-        match (harness, &session) {
-            (Harness::Claude, Some(session)) if opaque(session) => {}
-            (Harness::Goose, None) => {}
-            _ => return Err("Invalid harness session".into()),
+        // goose learns its session after discovery; association must be explicit.
+        if session.is_some() {
+            return Err("Invalid harness session".into());
         }
         let inference = bundle(gateway, inference)?;
         let discovery = bundle(gateway, discovery)?;

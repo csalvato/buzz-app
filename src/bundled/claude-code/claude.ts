@@ -1,4 +1,13 @@
 import { CLAUDE_HOOK_EVENTS, type ClaudeHook } from "./hooks";
+import {
+  type Attribution,
+  type Baseline,
+  customHeaders,
+  ineligible,
+  readBaseline,
+  UNAPPLIED,
+  UNREADABLE,
+} from "./attribution";
 // One `claude` process driven over its stream-json protocol: the protocol the
 // Claude Agent SDK speaks to the same binary, so no Node runtime is needed. The
 // process stays alive between turns; messages sent while it works are folded
@@ -27,8 +36,6 @@ export type ActivityReceipt = Readonly<{
   /** Told the message's id once Claude has taken it: the id its transcript
    * gives the prompt. A message Claude never took has none. */
   submitted?: (uuid: string) => void;
-  /** Told once Claude has taken the message into a turn, as it replays it. */
-  taken?: () => void;
 }>;
 
 export type Spawn = (
@@ -61,11 +68,6 @@ export type ClaudeLaunch = Readonly<{
   resume?: string;
   /** The id a new session takes, so it is known before its first turn. */
   sessionId?: string;
-  /** The gateway forwarding URL this process's inference goes to: one
-   * turn's generation, fixed for the process's life. `--settings` env wins
-   * over the person's own settings and merges the rest. `noProxy` is its
-   * NO_PROXY and no_proxy, the person's own with the URL's host added. */
-  forward?: Readonly<{ url: string; noProxy: string }>;
   /** The in-process MCP server's tools. */
   tools?: ToolServer;
   hook?: ClaudeHook;
@@ -116,39 +118,6 @@ const STDERR_LIMIT = 4_000;
 /** What `claude` is started with: as the SDK starts it, reporting when it is
  * idle, signed in as `claude auth login` left it, and never as part of a
  * Claude session that started the app. */
-/** What has Claude (2.1.323's strings) send its requests to a provider other
- * than Anthropic's API: on only for "1", "true", "yes" or "on". */
-export const PROVIDERS = [
-  "CLAUDE_CODE_USE_BEDROCK",
-  "CLAUDE_CODE_USE_VERTEX",
-  "CLAUDE_CODE_USE_FOUNDRY",
-  "CLAUDE_CODE_USE_GATEWAY",
-  "CLAUDE_CODE_USE_MANTLE",
-  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-  "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-] as const;
-/** What names the endpoint of Anthropic's API or a provider; an empty one
- * falls back to the default. */
-export const ENDPOINTS = [
-  "ANTHROPIC_BASE_URL",
-  "CLAUDE_CODE_API_BASE_URL",
-  "ANTHROPIC_UNIX_SOCKET",
-  "ANTHROPIC_BEDROCK_BASE_URL",
-  "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-  "ANTHROPIC_VERTEX_BASE_URL",
-  "ANTHROPIC_FOUNDRY_BASE_URL",
-  "ANTHROPIC_AWS_BASE_URL",
-  "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-] as const;
-/** A forwarded process's `--settings` env: its generation's URL, and every
- * provider and other endpoint blanked. Flag settings outrank the user's,
- * the project's and the local ones, whose `env` would otherwise apply after
- * launch; only managed settings outrank them. */
-export const forwardEnv = (url: string): Record<string, string> => ({
-  ...Object.fromEntries([...PROVIDERS, ...ENDPOINTS].map((name) => [name, ""])),
-  ANTHROPIC_BASE_URL: url,
-});
-
 export const ENV: Readonly<Record<string, string | null>> = {
   CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
   CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
@@ -166,6 +135,34 @@ export const ENV: Readonly<Record<string, string | null>> = {
   CLAUDE_AGENT_SDK_VERSION: null,
   CLAUDE_PID: null,
 };
+
+/** How long `claude.sh`'s inherited-headers check may take. */
+const INHERITED_CHECK_MS = 15_000;
+/** How long a turn or compaction waits on one attribution control call
+ * before going on unattributed. */
+const ATTRIBUTION_CALL_MS = 5_000;
+
+/** Whether the env `spawn` starts Claude with sets its custom headers, from
+ * `claude.sh`'s presence-only check; undefined when the check fails. */
+async function setsInheritedHeaders(spawn: Spawn) {
+  let answer = "";
+  try {
+    const check = await spawn("inherited-headers", {
+      env: ENV,
+      onStdout: (data) => {
+        answer += data;
+      },
+    });
+    const timer = setTimeout(() => void check.kill(), INHERITED_CHECK_MS);
+    const code = await check.exited;
+    clearTimeout(timer);
+    if (code !== 0) return undefined;
+  } catch {
+    return undefined;
+  }
+  const presence = answer.trim();
+  return presence === "set" ? true : presence === "unset" ? false : undefined;
+}
 
 export class ClaudeProcess {
   private protection: ClaudeProtection | undefined;
@@ -204,10 +201,6 @@ export class ClaudeProcess {
   private buffer = "";
   private stderr = "";
   private lastError: string | undefined;
-  private missing = false;
-  /** Claude reported idle after everything that could start a turn: its
-   * last send, background task change or turn. True before the first. */
-  private quiesced = true;
   /** A `/compact` was sent: its failure fails the turn, unlike an automatic
    * compaction's mid-turn. */
   private compacting = false;
@@ -225,11 +218,6 @@ export class ClaudeProcess {
   /** Called when it was active and is no longer. */
   onActivity: (() => void) | undefined;
   onQuiet?: () => void;
-  /** Called when Claude reports its session idle and nothing of it is
-   * active: the only point a forwarded turn's admission may end. A result,
-   * or background tasks finishing, is not: a finished task starts a turn of
-   * its own. */
-  onIdle?: () => void;
   private requests = 0;
   /** Control requests awaiting Claude's answer, by request id. */
   private calls = new Map<string, (response: Message) => void>();
@@ -242,6 +230,15 @@ export class ClaudeProcess {
   /** The session's own effort, read before the first change to restore it. */
   private ownEffort: string | undefined;
   private readingEffort: Promise<void> | undefined;
+  /** Its own settings, read once before Buzz's first attribution. */
+  private baseline: Promise<Baseline | undefined> | undefined;
+  /** Whether its inherited env sets custom headers; undefined if unknown. */
+  private inherited: () => Promise<boolean | undefined> = async () => undefined;
+  /** The provider `initialize` reported, such as "firstParty". */
+  private provider: Promise<string | undefined> = Promise.resolve(undefined);
+  /** The custom headers Buzz last applied; undefined while it applied none,
+   * null when a change it asked for may or may not have taken. */
+  private attributed: string | null | undefined;
   readonly exited: Promise<number | null>;
 
   private constructor(
@@ -334,12 +331,6 @@ export class ClaudeProcess {
           ? ["--json-schema", JSON.stringify(launch.outputSchema)]
           : []),
         ...(launch.effort ? ["--effort", launch.effort] : []),
-        ...(launch.forward
-          ? [
-              "--settings",
-              JSON.stringify({ env: forwardEnv(launch.forward.url) }),
-            ]
-          : []),
         ...(launch.resume ? ["--resume", launch.resume] : []),
         ...(!launch.resume && launch.sessionId
           ? ["--session-id", launch.sessionId]
@@ -392,23 +383,6 @@ export class ClaudeProcess {
               LD_LIBRARY_PATH: null,
             }
           : {}),
-        // A forwarded process's endpoint is its generation's alone: what
-        // would pick another provider or endpoint is cleared here and blanked
-        // in its flag settings. Managed settings, which outrank those, are
-        // checked before its generation opens; a turn none of whose requests
-        // reach the generation still fails.
-        ...(launch.forward
-          ? {
-              ...Object.fromEntries(
-                [...PROVIDERS, ...ENDPOINTS].map((name) => [name, null]),
-              ),
-              CLAUDE_CODE_REMOTE_SESSION_ID: null,
-              // In the process env, not flag settings, where it would replace
-              // a list the person's settings give their other hosts.
-              NO_PROXY: launch.forward.noProxy,
-              no_proxy: launch.forward.noProxy,
-            }
-          : {}),
         ...(launch.review
           ? {
               CLAUDE_CONFIG_DIR: launch.review.home,
@@ -457,6 +431,9 @@ export class ClaudeProcess {
       launch.hook,
     );
     claude.protection = launch.protection;
+    // Checked once, only when Buzz first attributes this process.
+    let inherited: Promise<boolean | undefined> | undefined;
+    claude.inherited = () => (inherited ??= setsInheritedHeaders(spawn));
     claude.resuming = !!launch.resume;
     claude.protectedInstructions = launch.systemPrompt ?? "";
     for (const data of earlyErrors) claude.readError(data);
@@ -556,6 +533,18 @@ export class ClaudeProcess {
             )
           : [];
       });
+      // Claude's resolved provider, which its process env can pick too.
+      this.provider = answer.then(
+        (response) => {
+          const account = (response.response as Message | undefined)?.account as
+            | Message
+            | undefined;
+          return typeof account?.apiProvider === "string"
+            ? account.apiProvider
+            : undefined;
+        },
+        () => undefined,
+      );
     } catch (error) {
       await this.kill();
       await this.exited;
@@ -575,19 +564,6 @@ export class ClaudeProcess {
   }
   get started() {
     return this.began;
-  }
-  /** At Claude's own idle, with nothing since that could start a turn: a
-   * finished background task may still start one until Claude says so. */
-  get idle() {
-    return this.quiesced;
-  }
-  /** Running a `/compact` it was sent. */
-  get compacts() {
-    return this.compacting;
-  }
-  /** Whether Claude said the session it was to resume doesn't exist. */
-  get missingSession() {
-    return this.missing;
   }
   get model() {
     return this.reported;
@@ -613,12 +589,93 @@ export class ClaudeProcess {
     return this.reported;
   }
 
+  /** Sets the custom headers the turns sent after it carry: `attribution`'s
+   * over the process's own when its own endpoint is the gateway's, else its
+   * own alone. A steer into a running turn keeps the turn's. Resolves with
+   * why the turn isn't attributed, as a notice; never throws, so a failure
+   * never stops the turn. */
+  async attribute(
+    attribution: Attribution | undefined,
+  ): Promise<string | undefined> {
+    if (!attribution && this.attributed === undefined) return;
+    // Read before Buzz's first change, so it is always the person's own.
+    this.baseline ??= Promise.all([
+      this.attributionCall({ subtype: "get_settings" }).then(readBaseline),
+      this.inherited(),
+    ]).then(([baseline, inherited]) => baseline && { ...baseline, inherited });
+    const baseline = await this.baseline;
+    // Unread, so Buzz changed nothing: a later turn asks again.
+    if (!baseline) {
+      this.baseline = undefined;
+      return attribution && UNREADABLE;
+    }
+    const reason =
+      attribution &&
+      ineligible(baseline, attribution.origin, await this.provider);
+    const headers =
+      attribution && !reason
+        ? customHeaders(
+            attribution.profile,
+            baseline.headers,
+            attribution.headers,
+          )
+        : (baseline.headers ?? "");
+    const current =
+      this.attributed === undefined
+        ? (baseline.headers ?? "")
+        : this.attributed;
+    if (headers === current) return reason;
+    // Only the one env key: Claude merges flag settings key by key, so its
+    // endpoint, sign-in, effort and model stay as they are.
+    // A change Claude takes late may undo a newer one, so its headers are
+    // unknown again and the next change is written whatever it is.
+    const answer = await this.attributionCall(
+      {
+        subtype: "apply_flag_settings",
+        settings: { env: { ANTHROPIC_CUSTOM_HEADERS: headers } },
+      },
+      () => {
+        this.attributed = null;
+      },
+    );
+    // Unknown until a later change takes, which a restore then still sends.
+    this.attributed = answer.subtype === "success" ? headers : null;
+    return answer.subtype === "success" ? reason : UNAPPLIED;
+  }
+
+  /** A control call attribution makes, answered as an error when it fails or
+   * Claude takes longer than `ATTRIBUTION_CALL_MS`, so it never holds up the
+   * turn or compaction waiting on it. A late answer is dropped, after
+   * `late` runs. */
+  private attributionCall(
+    request: Message,
+    late?: () => void,
+  ): Promise<Message> {
+    const { id, written, answer } = this.request(request);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<Message>((resolve) => {
+      timer = setTimeout(() => {
+        if (late) this.calls.set(id, late);
+        else this.calls.delete(id);
+        resolve({ subtype: "error", error: "timed out" });
+      }, ATTRIBUTION_CALL_MS);
+    });
+    return Promise.race([
+      written.then(
+        () => answer,
+        (): Message => {
+          this.calls.delete(id);
+          return { subtype: "error" };
+        },
+      ),
+      expired,
+    ]).finally(() => clearTimeout(timer));
+  }
+
   /** Sends one user message. Resolves when it, and anything sent after it, has
    * been answered and the session is idle again. A new turn runs with the
    * picked model and effort, or the session's own without them; a message
-   * folded into a running turn keeps the turn's model and effort, whatever
-   * it asks for, so a turn never switches model (and misses its prompt
-   * cache) partway. */
+   * folded into a running turn changes only what it asks for. */
   send(
     text: string,
     { model, effort, ...activity }: TurnPick & ActivityReceipt = {},
@@ -629,12 +686,11 @@ export class ClaudeProcess {
         error: "Claude is not running",
       });
     // The model first: effort applies to whichever model runs.
-    if (!this.busy) this.setModel(model);
-    if (!this.busy) this.setEffort(effort);
+    this.setModel(model !== undefined || !this.busy ? model : this.pickedModel);
+    this.setEffort(effort !== undefined || !this.busy ? effort : this.effort);
     const uuid = crypto.randomUUID();
     this.receipts.set(uuid, activity);
     this.pending++;
-    this.quiesced = false;
     if (text === "/compact") this.compacting = true;
     const settled = new Promise<Settled>((resolve) =>
       this.waiters.push(resolve),
@@ -695,7 +751,7 @@ export class ClaudeProcess {
       request_id: id,
       request,
     });
-    return { written, answer };
+    return { id, written, answer };
   }
   /** Sends a control request and resolves with Claude's response. */
   private call(request: Message): Promise<Message> {
@@ -824,11 +880,9 @@ export class ClaudeProcess {
       const active = this.active;
       this.working = message.state !== "idle";
       if (!this.working && this.pending) this.done();
-      this.quiesced = !this.active;
       if (!this.active) this.stopping = false;
       if (active !== this.active) this.onActivity?.();
       if (active && !this.active) this.onQuiet?.();
-      if (message.state === "idle" && !this.active) this.onIdle?.();
       return;
     }
     // The whole set each time; ambient tasks, such as watchers, are not activity.
@@ -838,11 +892,9 @@ export class ClaudeProcess {
       Array.isArray(message.tasks)
     ) {
       const active = this.active;
-      const tasks = message.tasks.filter(
+      this.tasks = message.tasks.filter(
         (task) => !(task as Message | null)?.ambient,
       ).length;
-      if (tasks !== this.tasks) this.quiesced = false;
-      this.tasks = tasks;
       if (!this.active) this.stopping = false;
       if (active !== this.active) this.onActivity?.();
       if (active && !this.active) this.onQuiet?.();
@@ -869,7 +921,6 @@ export class ClaudeProcess {
       const receipt = this.receipts.get(message.uuid);
       if (receipt) {
         this.receipts.delete(message.uuid);
-        receipt.taken?.();
         // Watches/timers have no message activity: they must not hide a mention.
         if (receipt.step) {
           const scope = receipt.activityScope ?? "conversation";
@@ -888,16 +939,6 @@ export class ClaudeProcess {
       return;
     }
     if (message.type !== "result") return;
-    // How Claude (2.1.286, 2.1.318) refuses a resume whose session it can't find,
-    // before it starts and exits.
-    const errors = Array.isArray(message.errors) ? message.errors : [];
-    if (
-      !this.began &&
-      errors.includes(
-        `No conversation found with session ID: ${this.sessionId}`,
-      )
-    )
-      this.missing = true;
     // A turn that finished before the interrupt took effect is not stopped,
     // and a stopped turn of its own has no message to settle.
     if (

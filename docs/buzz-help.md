@@ -510,6 +510,16 @@ available rather than silently discarding it.
   switching model; ask again later or choose another model in its Identity tab. Buzz never
   resends work already sent through the gateway without it. Don't say an agent
   uses the gateway's models unless its Settings shows Model gateway.
+- Where a build enables it, a Claude agent whose own Claude settings already
+  point at the agent gateway adds Buzz's session, agent and conversation
+  headers to each turn, keeping its other custom headers. Buzz never changes
+  Claude's endpoint, sign-in or provider. A turn that can't be attributed
+  (another endpoint or provider, settings Claude didn't report or take, or
+  custom headers set only in the environment Buzz was started from, which
+  Buzz leaves as they are)
+  still runs, and Activity notes "Not attributed in the agent gateway" with
+  the reason. Protected Claude agents are not attributed yet: their pinned
+  launch ignores Claude's settings files, including a gateway app's.
 - **Activity**, where the agent type provides it, shows sessions and their
   transcripts in the agent's profile. Once goose agents run through the agent
   gateway, a goose turn woken in a conversation by a plugin, watch or timer
