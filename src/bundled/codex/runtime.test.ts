@@ -116,8 +116,9 @@ function fixture(
   /** The turn each thread is running, as Codex tracks it: a `turn/start` on a
    * thread with one steers its input into that turn. */
   const live = new Map<string, string>();
-  /** The turn each `turn/start` was answered with. */
+  /** The turn each `turn/start` was answered with, and those steered into one. */
   const answers = new Map<Wire, string>();
+  const joined = new Set<Wire>();
   const toolCalls = new Map<
     number | string,
     { threadId: string | undefined; turnId: string; callId: string }
@@ -222,7 +223,9 @@ function fixture(
       // takes one. A thread with a running turn takes the input into it.
       if (request.method === "turn/start") {
         const thread = String(params.threadId);
-        const id = live.get(thread) ?? `turn-${starts().indexOf(request) + 1}`;
+        const running = live.get(thread);
+        if (running) joined.add(request);
+        const id = running ?? `turn-${starts().indexOf(request) + 1}`;
         live.set(thread, id);
         answers.set(request, id);
         result = { turn: { id } };
@@ -584,7 +587,11 @@ function fixture(
       },
     } as unknown as Parameters<typeof apply>[0]);
   }
-  const starts = () => sent.filter((wire) => wire.method === "turn/start");
+  /** The turns begun: starts Codex did not steer into a running turn. */
+  const starts = () =>
+    sent.filter((wire) => wire.method === "turn/start" && !joined.has(wire));
+  /** The starts Codex steered into the turn running on their thread. */
+  const steers = () => [...joined];
   /** The turn the `index`th start was answered with. */
   const turnOf = (index: number) =>
     answers.get(starts()[index] as Wire) ?? `turn-${index + 1}`;
@@ -718,6 +725,7 @@ function fixture(
     delivery,
     workingUntil,
     starts,
+    steers,
     complete,
     interrupt,
     snapshot,
@@ -1980,8 +1988,9 @@ describe("saved threads and protection state", () => {
     );
     return methods;
   };
+  // A thread already open continues without being resumed.
   const resumed = (methods: (string | undefined)[]) =>
-    methods.includes("thread/resume");
+    !methods.includes("thread/start");
 
   it("starts a new thread under a replacement protection state", async () => {
     const f = protectedPreview();
@@ -2277,10 +2286,65 @@ it("asks for reasoning summaries on a resumed turn", async () => {
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
   await f.complete(0, "FIRST");
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  await f.runtime.retire(pubkey);
   await f.runtime.run(f.delivery("@Codex second"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
   expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(true);
   expect(f.starts()[1]?.params).toMatchObject({ summary: "auto" });
+});
+it("asks for reasoning summaries on a turn of a thread left open", async () => {
+  const f = fixture();
+  await f.runtime.run(f.delivery("@Codex first"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  await f.complete(0, "FIRST");
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  await f.runtime.run(f.delivery("@Codex second"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(false);
+  expect(f.starts()[1]?.params).toMatchObject({ summary: "auto" });
+});
+it("reopens a thread left open when what it opens with changes", async () => {
+  const f = fixture();
+  await f.runtime.run(f.delivery("@Codex first"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  await f.complete(0, "FIRST");
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  const next = f.delivery("@Codex second");
+  await f.runtime.run({ ...next, agent: { ...next.agent, name: "Renamed" } });
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  const methods = f.sent.map((wire) => wire.method);
+  // The old subscription goes first: a resume ignores new instructions while
+  // a client is still subscribed.
+  expect(methods.indexOf("thread/unsubscribe")).toBeGreaterThan(-1);
+  expect(methods.indexOf("thread/resume")).toBeGreaterThan(
+    methods.indexOf("thread/unsubscribe"),
+  );
+  await f.complete(1, "SECOND");
+});
+it("lets go of a thread left open after it idles, and when its agent stops", async () => {
+  vi.useFakeTimers();
+  try {
+    const f = fixture();
+    await f.runtime.run(f.delivery("@Codex first"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    await f.complete(0, "FIRST");
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+    const unsubscribes = () =>
+      f.sent.filter((wire) => wire.method === "thread/unsubscribe").length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(unsubscribes()).toBe(0);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(unsubscribes()).toBe(1);
+    await f.runtime.run(f.delivery("@Codex second"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+    expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(true);
+    await f.complete(1, "SECOND");
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
+    await f.runtime.retire(pubkey);
+    expect(unsubscribes()).toBe(2);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 it("asks for reasoning summaries on a standalone watch turn", async () => {
   const f = fixture();
@@ -2367,7 +2431,7 @@ it("runs a mid-turn pick that differs from the running turn as the next turn ins
   await f.runtime.run({ ...f.delivery("harder"), effort: "high" });
   await f.complete(1, "SECOND");
   await vi.waitFor(() => expect(f.starts()).toHaveLength(3));
-  expect(f.sent.filter((wire) => wire.method === "turn/steer")).toHaveLength(0);
+  expect(f.steers()).toHaveLength(0);
   expect(f.starts().map(settings)).toEqual([
     { threadId: "thread-1", model: "test-model", effort: "low" },
     { threadId: "thread-1", model: "deep-model", effort: "xhigh" },
@@ -2381,7 +2445,7 @@ it("runs a mid-turn pick that differs from the running turn as the next turn ins
 });
 it("steers plain follow-ups behind a queued differing pick into that turn once it starts", async () => {
   const f = fixture();
-  const steers = () => f.sent.filter((wire) => wire.method === "turn/steer");
+  const steers = () => f.steers();
   await f.runtime.run(f.delivery("first"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
   await f.runtime.run({ ...f.delivery("deeper"), model: "deep-model" });
@@ -2420,14 +2484,45 @@ it("steers a mid-turn message whose pick matches the running turn, or has none",
     effort: "low",
   });
   await f.runtime.run(f.delivery("plain"));
-  await vi.waitFor(() =>
-    expect(f.sent.filter((wire) => wire.method === "turn/steer")).toHaveLength(
-      2,
-    ),
-  );
+  await vi.waitFor(() => expect(f.steers()).toHaveLength(2));
   f.complete();
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
   expect(f.starts()).toHaveLength(1);
+});
+it("sends a message whose history read outlasts the running turn as a turn/start on the thread, which Codex starts a turn for", async () => {
+  const f = fixture();
+  await f.runtime.run(f.delivery("first"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  const gate = deferred<EventData[]>();
+  f.read.mockImplementationOnce(() => gate.promise);
+  await f.runtime.run(f.delivery("second"));
+  await vi.waitFor(() => expect(f.read).toHaveBeenCalledTimes(2));
+  // The turn ends while the message's history is still being read.
+  await f.complete(0, "FIRST");
+  gate.resolve([]);
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  expect(inputText(f.starts()[1])).toContain("second");
+  // The thread stayed loaded, so the message needed no reopening or steering.
+  expect(
+    f.sent
+      .map((wire) => wire.method)
+      .filter((method) =>
+        [
+          "thread/start",
+          "thread/resume",
+          "thread/unsubscribe",
+          "turn/steer",
+        ].includes(method ?? ""),
+      ),
+  ).toEqual(["thread/start"]);
+  expect(
+    f.starts().map((wire) => (wire.params as { threadId: string }).threadId),
+  ).toEqual(["thread-1", "thread-1"]);
+  f.complete(1, "SECOND");
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
+  expect(
+    f.publish.mock.calls.map(([event]) => (event as EventData).content),
+  ).toEqual(["FIRST", "SECOND"]);
 });
 it("dates a binding by the latest message it took in or turn it ended", async () => {
   let now = 1_000;
@@ -2458,9 +2553,7 @@ it("serializes owner follow-ups and routes tool replies to the latest accepted r
     gate.resolve([]);
   }
   await Promise.all([a, b]);
-  await vi.waitFor(() =>
-    expect(f.sent.filter((w) => w.method === "turn/steer")).toHaveLength(2),
-  );
+  await vi.waitFor(() => expect(f.steers()).toHaveLength(2));
   // Each mention counts as working until the turn it was steered into answers.
   let settled = 0;
   for (const [done] of f.workingUntil.mock.calls)
@@ -2472,7 +2565,7 @@ it("serializes owner follow-ups and routes tool replies to the latest accepted r
   f.complete();
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
   await vi.waitFor(() => expect(settled).toBe(3));
-  const steering = f.sent.filter((wire) => wire.method === "turn/steer");
+  const steering = f.steers();
   expect(JSON.stringify(steering[0]?.params)).toContain("FIRST_STEER");
   expect(JSON.stringify(steering[1]?.params)).toContain("SECOND_STEER");
   expect(f.publish.mock.calls[0]?.[0]).toMatchObject({
@@ -2528,11 +2621,7 @@ it("cuts delayed history messages off before the request while applying current 
       later.trigger.event as EventData,
     ]);
   }
-  await vi.waitFor(() =>
-    expect(f.sent.filter((wire) => wire.method === "turn/steer")).toHaveLength(
-      1,
-    ),
-  );
+  await vi.waitFor(() => expect(f.steers()).toHaveLength(1));
   const params = f.starts()[0]?.params as { input: { text: string }[] };
   const history = params.input[0]?.text.match(
     /<thread-context>\n([\s\S]*?)\n<\/thread-context>/,
@@ -2543,9 +2632,7 @@ it("cuts delayed history messages off before the request while applying current 
       (message: { content: string }) => message.content,
     ),
   ).toEqual(["FUTURE_EDIT", "TIE_BEFORE"]);
-  expect(
-    JSON.stringify(f.sent.find((wire) => wire.method === "turn/steer")?.params),
-  ).toContain("LATER_REQUEST");
+  expect(JSON.stringify(f.steers()[0]?.params)).toContain("LATER_REQUEST");
   await f.complete();
   await vi.waitFor(() =>
     expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
@@ -2583,11 +2670,7 @@ it.each([
       ...latest,
       config: { ...(latest.config as object), scope },
     });
-    await vi.waitFor(() =>
-      expect(
-        f.sent.filter((wire) => wire.method === "turn/steer"),
-      ).toHaveLength(1),
-    );
+    await vi.waitFor(() => expect(f.steers()).toHaveLength(1));
     const after = JSON.stringify((await f.tool("read", {}))?.result);
     expect(after).toContain("LATEST_REQUEST");
     expect(after.includes("CURRENT_REQUEST")).toBe(whole || scope === "thread");
@@ -2623,9 +2706,11 @@ it("cleans background terminals on server interruption and permits same-thread r
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
   f.complete();
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
-  expect(f.sent.filter((wire) => wire.method === "thread/resume")).toHaveLength(
-    1,
-  );
+  // The interrupted turn left the thread open, so recovery continues on it.
+  expect(
+    f.starts().map((wire) => (wire.params as { threadId: string }).threadId),
+  ).toEqual(["thread-1", "thread-1"]);
+  expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(false);
 });
 it("registers a stopper that interrupts the turn it is running", async () => {
   const f = fixture();
@@ -2675,109 +2760,78 @@ it("refuses to stop a request still waiting for its turn, and leaves the running
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
 });
 
-it("refuses to stop a request queued behind a finished turn that is still cleaning up", async () => {
+it("refuses to stop a request waiting behind a stopped turn that is still ending", async () => {
   const f = fixture();
-  await f.runtime.run(f.delivery("first"));
+  const interruptible = vi.fn<NonNullable<Delivery["interruptible"]>>();
+  await f.runtime.run({ ...f.delivery("first"), interruptible });
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
-  const cleanup = deferred<void>();
-  f.held.set("thread/unsubscribe", cleanup.promise);
-  await f.complete(0, "FIRST");
+  const accepted = deferred<void>();
+  f.held.set("turn/interrupt", accepted.promise);
+  const stopping = interruptible.mock.calls[0]?.[0]();
   await vi.waitFor(() =>
-    expect(f.sent.some((wire) => wire.method === "thread/unsubscribe")).toBe(
-      true,
-    ),
+    expect(f.sent.some((wire) => wire.method === "turn/interrupt")).toBe(true),
   );
   const waiting = vi.fn<NonNullable<Delivery["interruptible"]>>();
   await f.runtime.run({ ...f.delivery("second"), interruptible: waiting });
   await expect(waiting.mock.calls[0]?.[0]()).rejects.toThrow(
     "Codex has not started on this message yet",
   );
-  // The request it did not stop runs once the finished turn lets go.
-  cleanup.resolve();
-  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  // The request it did not stop runs once the stopped turn has ended.
+  accepted.resolve();
+  await stopping;
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2), {
+    timeout: 3_000,
+  });
   expect(
     f.sent.filter((wire) => wire.method === "turn/interrupt"),
-  ).toHaveLength(0);
+  ).toHaveLength(1);
   f.complete(1, "SECOND");
-  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
 });
 
-it("takes messages that arrive behind a queued turn into it once it starts", async () => {
+it("starts the turn of the first message sent after a turn ended and steers the ones behind it into it", async () => {
   const f = fixture();
   await f.runtime.run(f.delivery("first"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
-  const cleanup = deferred<void>();
-  f.held.set("thread/unsubscribe", cleanup.promise);
   await f.complete(0, "FIRST");
-  await vi.waitFor(() =>
-    expect(f.sent.some((wire) => wire.method === "thread/unsubscribe")).toBe(
-      true,
-    ),
-  );
-  // "missed" arrives as the turn ends, so it queues; the rest wait behind it.
-  await f.runtime.run(f.delivery("missed"));
-  await f.runtime.run(f.delivery("then"));
-  await f.runtime.run(f.delivery("last"));
-  cleanup.resolve();
-  await vi.waitFor(() =>
-    expect(f.sent.filter((wire) => wire.method === "turn/steer")).toHaveLength(
-      2,
-    ),
-  );
-  expect(f.starts()).toHaveLength(2);
-  expect(inputText(f.starts()[1])).toContain("missed");
-  const steered = f.sent
-    .filter((wire) => wire.method === "turn/steer")
-    .map((wire) => JSON.stringify(wire.params));
-  expect(steered[0]).toContain("then");
-  expect(steered[1]).toContain("last");
-  f.complete(1, "SECOND");
-  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
-  expect(f.starts()).toHaveLength(2);
-});
-
-it("takes messages behind one that missed the ending turn into its turn", async () => {
-  const f = fixture();
-  await f.runtime.run(f.delivery("first"));
-  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
-  const cleanup = deferred<void>();
-  f.held.set("thread/unsubscribe", cleanup.promise);
-  await f.complete(0, "FIRST");
-  // All three were already behind the turn that ended, so "missed" starts
-  // the next one and the others join it.
+  // All three are sent while Codex is still answering the first of them.
+  const answer = deferred<void>();
+  f.held.set("turn/start", answer.promise);
   await Promise.all(
     ["missed", "then", "last"].map((text) => f.runtime.run(f.delivery(text))),
   );
-  cleanup.resolve();
   await vi.waitFor(() =>
-    expect(f.sent.filter((wire) => wire.method === "turn/steer")).toHaveLength(
+    expect(f.sent.filter((wire) => wire.method === "turn/start")).toHaveLength(
       2,
     ),
   );
+  answer.resolve();
+  await vi.waitFor(() => expect(f.steers()).toHaveLength(2));
   expect(f.starts()).toHaveLength(2);
   expect(inputText(f.starts()[1])).toContain("missed");
-  const steered = f.sent
-    .filter((wire) => wire.method === "turn/steer")
-    .map((wire) => JSON.stringify(wire.params));
+  const steered = f.steers().map((wire) => JSON.stringify(wire.params));
   expect(steered[0]).toContain("then");
   expect(steered[1]).toContain("last");
+  f.complete(1, "SECOND");
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
+  expect(f.starts()).toHaveLength(2);
 });
 
-it("starts a turn for a message that joined a turn that failed to start", async () => {
+it("tries each message behind one whose turn failed to start as a turn of its own", async () => {
   const f = fixture();
   await f.runtime.run(f.delivery("first"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
-  const cleanup = deferred<void>();
-  f.held.set("thread/unsubscribe", cleanup.promise);
   await f.complete(0, "FIRST");
+  const answer = deferred<void>();
+  f.held.set("turn/start", answer.promise);
   await f.runtime.run(f.delivery("missed"));
   await f.runtime.run(f.delivery("then"));
   f.failures.set("turn/start", "model busy");
-  cleanup.resolve();
+  answer.resolve();
   await vi.waitFor(() => expect(f.starts()).toHaveLength(3));
   expect(inputText(f.starts()[1])).toContain("missed");
   expect(inputText(f.starts()[2])).toContain("then");
-  expect(f.sent.some((wire) => wire.method === "turn/steer")).toBe(false);
+  expect(f.steers()).toHaveLength(0);
   expect(
     f.publish.mock.calls.map(([event]) => (event as EventData).content),
   ).not.toContainEqual(expect.stringContaining("Steering was not accepted"));
@@ -2832,7 +2886,7 @@ it("runs a message sent while a stopped turn is ending as the next turn, not ste
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2), {
     timeout: 3_000,
   });
-  expect(f.sent.some((wire) => wire.method === "turn/steer")).toBe(false);
+  expect(f.steers().length > 0).toBe(false);
   expect(inputText(f.starts()[1])).toContain("after");
   f.complete(1, "AFTER");
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
@@ -3472,7 +3526,7 @@ it("restores a persisted binding after reload and starts fresh in a different wo
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
   f.complete();
   await vi.waitFor(() =>
-    expect(f.sent.some((w) => w.method === "thread/unsubscribe")).toBe(true),
+    expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
   );
   f.runtime.dispose();
   await f.exits.promise;
@@ -3601,6 +3655,7 @@ it.each([{}, { workspace: "" }, { workspace: "  " }])(
       ).toMatchObject({ cwd: "/home/test/.buzz" });
     f.complete(0, "DONE");
     await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+    await f.runtime.retire(pubkey);
     await f.runtime.run({ ...f.delivery("again"), config });
     await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
     expect(
@@ -3690,9 +3745,7 @@ it("delivers a plain follow-up after startup without waiting for the running tur
   } finally {
     gate.resolve(f.process);
   }
-  await vi.waitFor(() =>
-    expect(f.sent.filter((w) => w.method === "turn/steer")).toHaveLength(1),
-  );
+  await vi.waitFor(() => expect(f.steers()).toHaveLength(1));
   expect(f.starts()).toHaveLength(1);
   f.complete();
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
@@ -3739,7 +3792,7 @@ it("starts the next turn when completion races a plain follow-up's history read"
     gate.resolve([]);
   }
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
-  expect(f.sent.filter((wire) => wire.method === "turn/steer")).toHaveLength(0);
+  expect(f.steers()).toHaveLength(0);
   f.complete(1, "SECOND");
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
   expect(f.publish.mock.calls[1]?.[0]).toMatchObject({ content: "SECOND" });
@@ -3753,13 +3806,8 @@ it.each(["/queue", "/stop", "/steer", "/reset"])(
     await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
     const content = `${command} ordinary text`;
     await f.runtime.run(f.delivery(content));
-    await vi.waitFor(() =>
-      expect(
-        f.sent.filter((wire) => wire.method === "turn/steer"),
-      ).toHaveLength(1),
-    );
-    const steer = f.sent.find((wire) => wire.method === "turn/steer")
-      ?.params as { input: { text: string }[] };
+    await vi.waitFor(() => expect(f.steers()).toHaveLength(1));
+    const steer = f.steers()[0]?.params as { input: { text: string }[] };
     expect(steer.input[0]?.text).toContain(
       `Request: ${JSON.stringify(content)}`,
     );
@@ -3810,7 +3858,7 @@ it.each(["v2", "v3", "v5", "v6", "v7", "v15", "v16"])(
   },
 );
 
-it("leaves a failed first startup unbound so the next mention can start fresh", async () => {
+it("leaves a failed first startup unbound and gives the next mention the thread it opened", async () => {
   const f = fixture();
   const reading = deferred<void>();
   const gate = deferred<void>();
@@ -3834,7 +3882,7 @@ it("leaves a failed first startup unbound so the next mention can start fresh", 
   await f.runtime.run(f.delivery("retry"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
   expect(f.sent.filter((wire) => wire.method === "thread/start")).toHaveLength(
-    2,
+    1,
   );
   expect(f.sent.filter((wire) => wire.method === "thread/resume")).toHaveLength(
     0,
@@ -3848,8 +3896,10 @@ it("leaves a failed first startup unbound so the next mention can start fresh", 
       )?.[1] ?? "{}",
     ),
   ).toMatchObject({
-    [JSON.stringify(["channel", root])]: { threadId: "thread-2" },
+    [JSON.stringify(["channel", root])]: { threadId: "thread-1" },
   });
+  // The thread no turn had begun on is still new, so its prompts are saved.
+  await vi.waitFor(() => expect(savedPrompts(f.storage)).toHaveLength(1));
 });
 
 it("continues a saved thread copied from the user's Codex home", async () => {
@@ -3858,6 +3908,7 @@ it("continues a saved thread copied from the user's Codex home", async () => {
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
   f.complete();
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  await f.runtime.retire(pubkey);
   const write = f.process.write;
   let resumes = 0;
   vi.spyOn(f.process, "write").mockImplementation(async (data) => {
@@ -3900,6 +3951,7 @@ it.each([
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
   f.complete();
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  await f.runtime.retire(pubkey);
   const write = f.process.write;
   vi.spyOn(f.process, "write").mockImplementation(async (data) => {
     const wire: Wire = JSON.parse(data);
@@ -4118,13 +4170,6 @@ it("uses the launched workspace for shared file tools and the owner view for enc
   const f = fixture();
   await f.runtime.run(f.delivery("work"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
-  await f.runtime.run({
-    ...f.delivery("follow-up"),
-    config: { workspace: "/tmp/different" },
-  });
-  await vi.waitFor(() =>
-    expect(f.sent.some((wire) => wire.method === "turn/steer")).toBe(true),
-  );
   expect(
     (await f.tool("mem_set", { slug: "mem/test", text: "remembered" }))?.result,
   ).toMatchObject({ success: true });
@@ -4396,7 +4441,7 @@ it.each([
     const write = f.process.write;
     f.process.write = async (data) => {
       const wire: Wire = JSON.parse(data);
-      if (wire.method !== "turn/steer") return write(data);
+      if (wire.method !== "turn/start") return write(data);
       if (wire.id === undefined) throw new Error("Expected steering RPC id");
       requested.resolve();
       await response.promise;
@@ -4514,9 +4559,7 @@ it.each(["stream", "dm"])(
     // conversation; this one has no saved watch, so it does not run at all.
     const wakeDone = f.workingUntil.mock.calls.at(-1)?.[0];
     await expect(wakeDone).resolves.toEqual({ ok: true });
-    await vi.waitFor(() =>
-      expect(f.sent.filter((w) => w.method === "turn/steer")).toHaveLength(1),
-    );
+    await vi.waitFor(() => expect(f.steers()).toHaveLength(1));
     expect(f.sent.filter((w) => w.method === "thread/start")).toHaveLength(1);
     // A tool call waits for the steering chain, establishing that it was taken.
     await f.tool("send", {
@@ -4562,9 +4605,7 @@ it("delivers pending owner steering after a final send and posts its own answer"
   } finally {
     gate.resolve([]);
   }
-  await vi.waitFor(() =>
-    expect(f.sent.some((wire) => wire.method === "turn/steer")).toBe(true),
-  );
+  await vi.waitFor(() => expect(f.steers().length > 0).toBe(true));
   // The prior answer settles only the first request.
   let steered = false;
   void Promise.resolve(f.workingUntil.mock.calls[1]?.[0]).then(() => {
@@ -4591,7 +4632,7 @@ it("lets go of a rejected steering mention without ending the running turn", asy
   const write = f.process.write;
   vi.spyOn(f.process, "write").mockImplementation(async (data) => {
     const wire: Wire = JSON.parse(data);
-    if (wire.method !== "turn/steer" || wire.id == null) return write(data);
+    if (wire.method !== "turn/start" || wire.id == null) return write(data);
     f.sent.push(wire);
     f.emit({ id: wire.id, error: { code: -32600, message: "model busy" } });
   });
@@ -4613,7 +4654,8 @@ it("lets go of a rejected steering mention without ending the running turn", asy
   expect(f.workingUntil).toHaveBeenCalledTimes(2);
   expect(rejected).toBe(true);
   expect(working).toBe(false);
-  expect(f.starts()).toHaveLength(1);
+  // The refused message's start is the second; it began no turn.
+  expect(f.starts()).toHaveLength(2);
   await f.complete(0, "FIRST ANSWER");
   await vi.waitFor(() =>
     expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
@@ -4636,7 +4678,7 @@ it("keeps a rejected steering mention's notes for the next turn, ahead of newer 
   const write = f.process.write;
   vi.spyOn(f.process, "write").mockImplementation(async (data) => {
     const wire: Wire = JSON.parse(data);
-    if (wire.method !== "turn/steer" || wire.id == null) return write(data);
+    if (wire.method !== "turn/start" || wire.id == null) return write(data);
     pending.channel = [...(pending.channel ?? []), "(newer)"];
     f.emit({ id: wire.id, error: { code: -32600, message: "model busy" } });
   });
@@ -4715,11 +4757,8 @@ it.each([
       params: { threadId, turn: { id: "turn-1", status: "completed" } },
     });
     await vi.waitFor(() =>
-      expect(f.sent.some((wire) => wire.method === "thread/unsubscribe")).toBe(
-        true,
-      ),
+      expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
     );
-    expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle");
     expect(
       f.sent.some((wire) =>
         wire.method?.startsWith("thread/backgroundTerminals/"),
@@ -4876,7 +4915,7 @@ it("always offers the attention tools, on search, keeps the thread when attentio
   await vi.waitFor(() =>
     expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
   );
-  // Off, the thread is resumed with the same tools and instructions; only
+  // Off, the thread stays open with the same tools and instructions; only
   // the turn says that attention is off.
   await f.runtime.run(f.delivery("@Codex without attention"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
@@ -4884,7 +4923,7 @@ it("always offers the attention tools, on search, keeps the thread when attentio
     1,
   );
   expect(f.sent.filter((wire) => wire.method === "thread/resume")).toHaveLength(
-    1,
+    0,
   );
   const next = f.starts()[1]?.params as { input: { text: string }[] };
   expect(next.input[0]?.text).toMatch(
@@ -5062,11 +5101,11 @@ it("offers the tools plugins add, runs them as the agent here, and starts a new 
   await vi.waitFor(() =>
     expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
   );
-  // Unchanged, the thread resumes with the tools it has.
+  // Unchanged, the thread stays open with the tools it has.
   await f.runtime.run(f.delivery("@Codex again"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
   expect(f.sent.filter((wire) => wire.method === "thread/resume")).toHaveLength(
-    1,
+    0,
   );
   const saved = JSON.parse(
     f.storage.get(`buzz.codex.sessions.v17:${scope}:${pubkey}`) ?? "{}",
@@ -5082,9 +5121,13 @@ it("offers the tools plugins add, runs them as the agent here, and starts a new 
   f.added.length = 0;
   await f.runtime.run(f.delivery("@Codex once more"));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(3));
+  // The open thread is let go before the new one starts.
   expect(f.sent.filter((wire) => wire.method === "thread/resume")).toHaveLength(
-    1,
+    0,
   );
+  expect(
+    f.sent.filter((wire) => wire.method === "thread/unsubscribe"),
+  ).toHaveLength(1);
   expect(names(1)?.map((tool) => tool.name)).not.toContain("tasks_create");
   const gone = await f.tool("tasks_create", { title: "Late" });
   expect(JSON.stringify(gone)).toContain("No active Buzz tool");
@@ -5426,9 +5469,7 @@ it("continues an owner's Solo chat as one channel conversation posted at the top
     ...f.delivery("@Codex also", "e".repeat(64)),
     ...next,
   });
-  await vi.waitFor(() =>
-    expect(f.sent.filter((w) => w.method === "turn/steer")).toHaveLength(1),
-  );
+  await vi.waitFor(() => expect(f.steers()).toHaveLength(1));
   await vi.waitFor(() => expect(activity.superseded).toHaveBeenCalledOnce());
   expect(activity.acknowledged).toHaveBeenCalledWith(undefined);
   expect(next.acknowledged).toHaveBeenCalledWith({ steering: true });
@@ -5455,12 +5496,11 @@ it("continues an owner's Solo chat as one channel conversation posted at the top
   await vi.waitFor(() =>
     expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
   );
-  // A later prompt in a different thread resumes the same Codex thread.
+  // A later prompt in a different thread continues the same Codex thread.
   await f.runtime.run(f.delivery("@Codex later", "7".repeat(64)));
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
-  expect(
-    f.sent.find((w) => w.method === "thread/resume")?.params,
-  ).toMatchObject({ threadId: "thread-1" });
+  expect(f.starts()[1]?.params).toMatchObject({ threadId: "thread-1" });
+  expect(f.sent.some((w) => w.method === "thread/resume")).toBe(false);
   f.exits.resolve(3);
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(3));
   expect(f.publish.mock.calls[2]?.[0]).toMatchObject({
@@ -5592,7 +5632,7 @@ it("finishes a Solo turn under its policy when the chat is converted mid-turn", 
   await f.runtime.run(channelScope(f.delivery("@Codex after share")));
   // The converted chat's request waits for the Solo turn instead of steering in.
   await f.tool("send", { audience: "everyone", text: "Progress" });
-  expect(f.sent.filter((w) => w.method === "turn/steer")).toHaveLength(0);
+  expect(f.steers()).toHaveLength(0);
   expect(f.starts()).toHaveLength(1);
   await f.complete(0, "FIRST");
   await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
@@ -6043,7 +6083,7 @@ it("queues an ordinary follow-up when a source is cancelled during startup histo
   gate.resolve();
   await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
   expect(inputText(f.starts()[0])).toContain("ordinary follow-up");
-  expect(f.sent.filter((w) => w.method === "turn/steer")).toHaveLength(0);
+  expect(f.steers()).toHaveLength(0);
   await f.complete(0);
 });
 
@@ -6245,6 +6285,17 @@ it("keeps callbacks live beside terminals and lets a title finish after its admi
   enabled = false;
   expect(await call()).toMatchObject({ result: { content: [{ text: "{}" }] } });
   await f.complete(0, "FIRST");
+  // The thread stays open, with its bridge, until something changes.
+  await vi.waitFor(() =>
+    expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Idle"),
+  );
+  expect(close).not.toHaveBeenCalled();
+  // New instructions reopen the thread, which closes the old bridge.
+  const delivery = f.delivery("@Codex again");
+  await f.runtime.run({
+    ...delivery,
+    agent: { ...delivery.agent, name: "Renamed" },
+  });
   await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
   expect(
     f.sent.some(
@@ -6300,6 +6351,7 @@ it.each([
     ).toBe(!disabled);
     expect(f.sent.some((wire) => wire.method === "hooks/list")).toBe(!disabled);
     await f.complete(0);
+    await f.runtime.retire(pubkey);
     await f.runtime.run(f.delivery("@Codex again"));
     await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
     const resumed = f.sent.find((wire) => wire.method === "thread/resume")
@@ -6499,15 +6551,10 @@ describe("voice seats", () => {
       expect.any(Function),
     );
     await f.runtime.run(f.delivery("change that"));
-    await vi.waitFor(() =>
-      expect(f.sent.some((w) => w.method === "turn/steer")).toBe(true),
-    );
+    await vi.waitFor(() => expect(f.steers().length > 0).toBe(true));
     expect(f.starts()).toHaveLength(0);
-    const steer = f.sent.find((w) => w.method === "turn/steer");
-    expect(steer?.params).toMatchObject({
-      threadId: "thread-1",
-      expectedTurnId: "voice-1",
-    });
+    const steer = f.steers()[0];
+    expect(steer?.params).toMatchObject({ threadId: "thread-1" });
     f.abort.abort();
     await f.connection.close();
     expect(f.sent.some((w) => w.method === "turn/interrupt")).toBe(true);
@@ -6694,6 +6741,8 @@ describe("voice seats", () => {
       { threadId: "thread-1", turnId: "voice-1" },
     );
     expect(result?.result).toMatchObject({ success: true });
+    // The queued text joins the backend turn instead of replacing it.
+    await vi.waitFor(() => expect(f.steers()).toHaveLength(1));
     expect(f.starts()).toHaveLength(0);
     f.emit({
       method: "turn/completed",
@@ -6702,8 +6751,6 @@ describe("voice seats", () => {
         turn: { id: "voice-1", status: "completed" },
       },
     });
-    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
-    f.complete(0, "DONE");
     await connection.close();
   });
   it("closes a late media open after the seat was aborted", async () => {
@@ -6816,7 +6863,7 @@ it("rejects an execution open that completes after the agent retires", async () 
   expect(f.spawn).not.toHaveBeenCalled();
 });
 
-it("runs bound Codex tools in the guest workspace, resumes, and stops on provider unload", async () => {
+it("runs bound Codex tools in the guest workspace, reuses its thread, and stops on provider unload", async () => {
   vi.useFakeTimers();
   try {
     const lifetime = new AbortController();
@@ -6871,7 +6918,7 @@ it("runs bound Codex tools in the guest workspace, resumes, and stops on provide
     );
     await f.runtime.run(f.delivery("resume"));
     await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
-    expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(true);
+    expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(false);
     const delivery = f.delivery("unused");
     await f.runtime.session(
       { ...delivery.agent, config: delivery.config } as unknown as Agent,
@@ -7221,7 +7268,12 @@ it("retries a refused first turn but requires New when an accepted remote rollou
     "thread/resume",
     "no rollout found for thread id thread-2",
   );
-  await f.runtime.run(f.delivery("resume accepted turn"));
+  // The thread stays open between turns, so resuming takes a reopen.
+  const renamed = f.delivery("resume accepted turn");
+  await f.runtime.run({
+    ...renamed,
+    agent: { ...renamed.agent, name: "Renamed" },
+  });
   await vi.waitFor(() =>
     expect(f.runtime.sessionState(agent, { channelId: "channel", root })).toBe(
       "idle",
@@ -7383,10 +7435,7 @@ it("keeps restored history when the next turn is refused after a lost first resp
     guest.sent
       .filter((wire) => wire.method === "thread/resume")
       .map((wire) => wire.params),
-  ).toEqual([
-    expect.objectContaining({ threadId: "accepted-history" }),
-    expect.objectContaining({ threadId: "accepted-history" }),
-  ]);
+  ).toEqual([expect.objectContaining({ threadId: "accepted-history" })]);
   expect(guest.sent.some((wire) => wire.method === "thread/start")).toBe(false);
   await guest.complete(1);
 });
@@ -7718,7 +7767,8 @@ describe("a conversation given its own folder", () => {
     );
     f.complete(0, "DONE");
     await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
-    // Its next turn resumes the thread in the same folder.
+    // Once reloaded, its next turn resumes the thread in the same folder.
+    await f.runtime.retire(pubkey);
     await f.runtime.run(f.delivery("again"));
     await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
     expect(
