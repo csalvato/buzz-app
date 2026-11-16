@@ -510,6 +510,14 @@ available rather than silently discarding it.
   switching model; ask again later or choose another model in its Identity tab. Buzz never
   resends work already sent through the gateway without it. Don't say an agent
   uses the gateway's models unless its Settings shows Model gateway.
+- Once local Codex agents run through the agent gateway, Codex sends each
+  turn's Buzz context with the model provider configured for it on that
+  device, so the gateway can attribute the turn. A new message for a Codex
+  agent that is busy in the conversation waits for that turn to finish and
+  then runs as its own turn rather than joining the running one, so each
+  message keeps its own attribution. When Codex uses its built-in provider, or
+  runs on another machine, its turns run without that context, and Activity
+  shows "Ran without the Buzz context" with the reason.
 - **Activity**, where the agent type provides it, shows sessions and their
   transcripts in the agent's profile. Once goose agents run through the agent
   gateway, a goose turn woken in a conversation by a plugin, watch or timer

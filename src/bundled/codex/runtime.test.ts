@@ -39,6 +39,9 @@ import { wake } from "../../features/agent-harness/wakes";
 import type { Wire } from "./rpc";
 import {
   COMPACT_ORDINARY,
+  FROM_GATEWAY,
+  NO_PROVIDER,
+  REMOTE_UNATTRIBUTED,
   ROUTE_CHANGED,
   TO_GATEWAY,
   UNCERTAIN,
@@ -6513,6 +6516,7 @@ describe("gateway turns", () => {
         },
       },
     },
+    execution?: ConstructorParameters<typeof CodexRuntime>[8],
   ) {
     let route: GatewayRoute = eligible();
     const listeners = new Set<() => void>();
@@ -6533,7 +6537,7 @@ describe("gateway turns", () => {
       providers,
       undefined,
       undefined,
-      undefined,
+      execution,
       undefined,
       undefined,
       undefined,
@@ -6615,7 +6619,7 @@ describe("gateway turns", () => {
     await f.complete();
   });
 
-  it("adds nothing when Codex runs its built-in provider, which takes no headers", async () => {
+  it("adds nothing, and says so, when Codex runs its built-in provider, which takes no headers", async () => {
     const { f, gatewayed } = routed({});
     await f.runtime.run(gatewayed("@Codex one"));
     await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
@@ -6624,7 +6628,58 @@ describe("gateway turns", () => {
     await vi.waitFor(() =>
       expect(methods(f, "thread/unsubscribe")).toHaveLength(1),
     );
+    await vi.waitFor(() =>
+      expect(f.runtime.sessions(pubkey)[0]?.detail).toBe(NO_PROVIDER),
+    );
     expect([...f.storage.values()].join()).not.toContain("client_session_id");
+  });
+
+  it("says a watch or timer ran without the context when Codex runs its built-in provider", async () => {
+    const { f, gatewayed } = routed({});
+    const done = f.runtime.runOnce({
+      delivery: gatewayed("@Codex wake", null),
+      key: "interest/x",
+      signal: new AbortController().signal,
+      prompt: async () => "check",
+    });
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    expect(configOf(methods(f, "thread/start")[0])).not.toHaveProperty(HEADERS);
+    await f.complete(0, "");
+    await expect(done).resolves.toEqual({ ok: true });
+    expect(
+      f.runtime.sessions(pubkey).find((s) => s.detail === NO_PROVIDER),
+    ).toBeDefined();
+  });
+
+  it("sends nothing from a remote agent, and says so", async () => {
+    const lifetime = new AbortController();
+    let f!: ReturnType<typeof fixture>;
+    const target: AgentExecution = {
+      workspace: "/guest/project",
+      signal: lifetime.signal,
+      spawn: vi.fn(async (_program, options) => {
+        options?.onStdout?.(
+          `${JSON.stringify({ buzzCodexHook: "ready", url: "http://127.0.0.1:1234" })}\n`,
+        );
+        return f.spawn("app-server", options);
+      }),
+      resolveDirectory: vi.fn(async (path) => path),
+      readFile: vi.fn(async () => new TextEncoder().encode("")),
+      dispose: vi.fn(async () => lifetime.abort(new Error("unloaded"))),
+    };
+    const routing = routed(undefined, async () => target);
+    f = routing.f;
+    await f.runtime.run(routing.gatewayed("@Codex remote"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    const started = methods(f, "thread/start")[0];
+    expect(started?.params).toMatchObject({ cwd: "/guest/project" });
+    expect(configOf(started)).not.toHaveProperty(HEADERS);
+    expect(JSON.stringify(f.sent)).not.toContain("x-gw-");
+    await f.complete();
+    await vi.waitFor(() =>
+      expect(f.runtime.sessions(pubkey)[0]?.detail).toBe(REMOTE_UNATTRIBUTED),
+    );
+    await target.dispose();
   });
 
   it("starts a new thread, and says so, when a conversation's mode changes", async () => {
@@ -6659,6 +6714,69 @@ describe("gateway turns", () => {
       "x-gw-ctx-message-id": second.gateway?.turn.message_id,
     });
     await f.complete(1);
+  });
+
+  it("runs a gateway delivery as its own turn instead of steering it into an ordinary one", async () => {
+    const { f, gatewayed } = routed();
+    await f.runtime.run(f.delivery("@Codex ordinary"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    await f.runtime.run(gatewayed("@Codex routed"));
+    await f.complete(0);
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+    expect(methods(f, "turn/steer")).toHaveLength(0);
+    // It changed the conversation's mode, so it runs on a thread of its own.
+    expect(configOf(methods(f, "thread/start")[1])).toHaveProperty(HEADERS);
+    expect(inputText(f.starts()[1])).toContain(TO_GATEWAY);
+    await f.complete(1);
+  });
+
+  it("runs an ordinary delivery as its own turn instead of steering it into a gateway one", async () => {
+    const { f, gatewayed } = routed();
+    await f.runtime.run(gatewayed("@Codex routed"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    await f.runtime.run(f.delivery("@Codex ordinary"));
+    await f.complete(0);
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+    expect(methods(f, "turn/steer")).toHaveLength(0);
+    expect(configOf(methods(f, "thread/start")[1])).not.toHaveProperty(HEADERS);
+    expect(inputText(f.starts()[1])).toContain(FROM_GATEWAY);
+    await f.complete(1);
+  });
+
+  it("titles a new Solo chat with its turn's frozen context, and stops the title when the route moves on", async () => {
+    const { f, gatewayed, move } = routed();
+    asSoloChat(f);
+    const named = vi.fn();
+    const first = gatewayed("@Codex fix the login bug");
+    await f.runtime.run({ ...first, named });
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+    const [main, title] = methods(f, "thread/start");
+    expect(title?.params).toMatchObject({
+      ephemeral: true,
+      sandbox: "read-only",
+    });
+    // The very bundle the turn's own thread carries, session and all.
+    expect(configOf(title)[HEADERS]).toEqual(configOf(main)[HEADERS]);
+    expect(configOf(title)[HEADERS]).toMatchObject({
+      "x-gw-ctx-message-id": first.gateway?.turn.message_id,
+    });
+    move(eligible(2));
+    await vi.waitFor(() =>
+      expect(
+        methods(f, "turn/interrupt").map(
+          (wire) => (wire.params as { threadId: string }).threadId,
+        ),
+      ).toEqual(expect.arrayContaining(["thread-1", "thread-2"])),
+    );
+    await vi.waitFor(() =>
+      expect(
+        methods(f, "thread/unsubscribe").some(
+          (wire) =>
+            (wire.params as { threadId: string }).threadId === "thread-2",
+        ),
+      ).toBe(true),
+    );
+    expect(named).not.toHaveBeenCalled();
   });
 
   it("leaves a thread unavailable when Codex doesn't confirm its release, until a new session", async () => {
