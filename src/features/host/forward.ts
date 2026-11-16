@@ -4,7 +4,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
  * (`src-tauri/src/host_forward.rs`). Desktop only. */
 
 export type ForwardOwner = Readonly<{ id: string; revision: string }>;
-export type ForwardHarness = "claude" | "goose";
+export type ForwardHarness = "goose";
 export type ForwardClass = "discovery" | "inference";
 
 export type ForwardEvent =
@@ -33,8 +33,6 @@ export type ForwardOpen = Readonly<{
   route: string;
   routeRevision: number;
   harness: ForwardHarness;
-  /** Claude: its spawn session. goose: omitted, then `associateForward`. */
-  session?: string;
   inference: Readonly<Record<string, string>>;
   discovery: Readonly<Record<string, string>>;
   onEvent: (event: ForwardEvent) => void;

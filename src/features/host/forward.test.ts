@@ -48,8 +48,7 @@ it("opens a generation and delivers its events", async () => {
   const opened = await openForward(owner, {
     route: "route-a",
     routeRevision: 2,
-    harness: "claude",
-    session: "s-1",
+    harness: "goose",
     inference: { "x-a": "1" },
     discovery: {},
     onEvent: (event) => events.push(event),
@@ -70,8 +69,7 @@ it("opens a generation and delivers its events", async () => {
     revision: "abc",
     route: "route-a",
     routeRevision: 2,
-    harness: "claude",
-    session: "s-1",
+    harness: "goose",
     inference: { "x-a": "1" },
     discovery: {},
   });

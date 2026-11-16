@@ -424,7 +424,6 @@ fn gateway_grant(mut manifest: Manifest, gateway: Option<&gateway::Native>) -> M
     };
     let reaches = match manifest.id.as_str() {
         "buzz.agents" => true,
-        "buzz.claude-code" => gateway.upstreams.contains_key("claude-code"),
         "buzz.goose" => gateway.upstreams.contains_key("goose"),
         _ => false,
     };
@@ -2500,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn only_agents_and_configured_harnesses_reach_the_agent_gateway_origin() {
+    fn only_agents_and_configured_goose_reach_the_agent_gateway_origin() {
         let descriptor = |upstreams: serde_json::Value| {
             let raw = serde_json::json!({
                 "version": 2,
@@ -2558,24 +2557,19 @@ mod tests {
         assert!(origins(None, "buzz.agents").is_empty());
         assert_eq!(origins(None, "buzz.claude-code"), [claude_own]);
         assert!(origins(None, "buzz.goose").is_empty());
-        // Agents and each harness with a forwarded upstream gain the origin.
+        // Only Agents and configured goose need the native gateway origin.
         assert_eq!(origins(Some(both), "buzz.agents"), [gateway]);
-        assert_eq!(
-            origins(Some(both), "buzz.claude-code"),
-            [claude_own, gateway]
-        );
+        assert_eq!(origins(Some(both), "buzz.claude-code"), [claude_own]);
         assert_eq!(origins(Some(both), "buzz.goose"), [gateway]);
-        assert_eq!(
-            origins(Some(claude), "buzz.claude-code"),
-            [claude_own, gateway]
-        );
+        assert_eq!(origins(Some(claude), "buzz.claude-code"), [claude_own]);
         assert!(origins(Some(claude), "buzz.goose").is_empty());
         assert_eq!(origins(Some(goose), "buzz.claude-code"), [claude_own]);
         assert_eq!(origins(Some(goose), "buzz.goose"), [gateway]);
         assert_eq!(origins(Some(pi), "buzz.claude-code"), [claude_own]);
         assert!(origins(Some(pi), "buzz.goose").is_empty());
-        // No other plugin does.
+        // Direct Claude headers do not need a native network grant.
         for gateway in [both, claude, goose, pi] {
+            assert_eq!(origins(Some(gateway), "buzz.claude-code"), [claude_own]);
             assert_eq!(origins(Some(gateway), "buzz.codex"), [codex_own]);
             assert!(origins(Some(gateway), "buzz.pi").is_empty());
             assert!(origins(Some(gateway), "buzz.channels").is_empty());
@@ -2614,11 +2608,14 @@ mod tests {
             opened.change("disable", id).unwrap();
             assert!(manager.host_grants(id, "bundled").is_err());
             opened.change("enable", id).unwrap();
-            assert!(manager
-                .host_grants(id, "bundled")
-                .unwrap()
-                .network_origins
-                .contains(&gateway.to_owned()));
+            assert_eq!(
+                manager
+                    .host_grants(id, "bundled")
+                    .unwrap()
+                    .network_origins
+                    .contains(&gateway.to_owned()),
+                id == "buzz.goose"
+            );
         }
         // The build's own gateway is what `open` uses.
         assert_eq!(
