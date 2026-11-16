@@ -58,6 +58,25 @@ import {
 
 // The plugin registers only in the Mac/Linux desktop app.
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => true }));
+/** What the gateway's own route module reports, where a test sets it. */
+const liveRoutes = vi.hoisted(() => ({
+  route: undefined as unknown,
+  upstream: undefined as unknown,
+}));
+vi.mock("../../features/agents/gateway/route", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("../../features/agents/gateway/route")
+    >();
+  return {
+    ...actual,
+    routeFor: (key: string) =>
+      (liveRoutes.route as GatewayRoute | undefined) ?? actual.routeFor(key),
+    upstreamFor: (harness: string) =>
+      (liveRoutes.upstream as { base: string } | undefined) ??
+      actual.upstreamFor(harness),
+  };
+});
 
 const owner = "a".repeat(64);
 const pubkey = "b".repeat(64);
@@ -6843,6 +6862,115 @@ describe("gateway turns", () => {
     );
     // Its end was seen and its release confirmed: the thread stays usable.
     expect(f.runtime.sessions(pubkey)[0]?.detail).not.toBe(UNCERTAIN);
+  });
+
+  it.each([
+    ["an eligible route, with a provider of its own", () => eligible()],
+    [
+      "a blocked route",
+      (): GatewayRoute => ({
+        kind: "blocked",
+        revision: 1,
+        gatewayOrigin: "https://gateway.test",
+        reason: "network",
+        message: "unreachable",
+      }),
+    ],
+    [
+      "a pending route",
+      (): GatewayRoute => ({
+        kind: "blocked",
+        revision: 1,
+        gatewayOrigin: "https://gateway.test",
+        reason: "readiness_pending",
+        message: "pending",
+      }),
+    ],
+  ])(
+    "compacts as ever with gateway mode off, under %s",
+    async (_name, route) => {
+      // The gateway's own routes say Codex routes there, but a runtime given
+      // none, as with gateway mode off, never reads them.
+      liveRoutes.route = route();
+      liveRoutes.upstream = upstream;
+      try {
+        const f = fixture([], undefined, false, {
+          model_provider: "corp",
+          model_providers: { corp: { http_headers: { "x-team": "t" } } },
+        });
+        const delivery = f.delivery("@Codex ordinary");
+        const agent = {
+          key: pubkey,
+          pubkey,
+          config: delivery.config,
+        } as unknown as Agent;
+        const place = { channelId: "channel", root };
+        await f.runtime.run(delivery);
+        await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+        await f.complete();
+        await vi.waitFor(() =>
+          expect(f.runtime.sessionState(agent, place)).toBe("idle"),
+        );
+        const compacted = f.runtime.session(agent, place, "compact");
+        await vi.waitFor(() =>
+          expect(methods(f, "thread/compact/start")).toHaveLength(1),
+        );
+        expect(configOf(methods(f, "thread/resume").at(-1))).not.toHaveProperty(
+          HEADERS,
+        );
+        f.emit({
+          method: "turn/started",
+          params: { threadId: "thread-1", turn: { id: "compact" } },
+        });
+        f.emit({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "compact", status: "completed" },
+          },
+        });
+        await expect(compacted).resolves.toBeUndefined();
+        expect(JSON.stringify(f.sent)).not.toContain("x-gw-");
+      } finally {
+        liveRoutes.route = undefined;
+        liveRoutes.upstream = undefined;
+      }
+    },
+  );
+
+  it("says both that the mode changed and that the context is missing", async () => {
+    const providers: {
+      model_provider?: string;
+      model_providers?: Record<
+        string,
+        { http_headers: Record<string, string> }
+      >;
+    } = {
+      model_provider: "corp",
+      model_providers: { corp: { http_headers: {} } },
+    };
+    const { f, gatewayed } = routed(providers);
+    await f.runtime.run(gatewayed("@Codex routed"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+    await f.complete();
+    await vi.waitFor(() =>
+      expect(methods(f, "thread/unsubscribe")).toHaveLength(1),
+    );
+    // Codex now runs its built-in provider: the gateway delivery runs
+    // unattributed, on an ordinary thread of its own.
+    delete providers.model_provider;
+    await f.runtime.run(gatewayed("@Codex again"));
+    await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+    expect(methods(f, "thread/start")).toHaveLength(2);
+    expect(configOf(methods(f, "thread/start")[1])).not.toHaveProperty(HEADERS);
+    expect(inputText(f.starts()[1])).toContain(FROM_GATEWAY);
+    expect(inputText(f.starts()[1])).not.toContain(NO_PROVIDER);
+    await f.complete();
+    await vi.waitFor(() =>
+      expect(f.runtime.sessions(pubkey)[0]?.detail).toBe(
+        `${FROM_GATEWAY} ${NO_PROVIDER}`,
+      ),
+    );
   });
 
   it("compacts only in the mode the thread ran in, under the control's context", async () => {

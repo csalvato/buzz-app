@@ -517,7 +517,8 @@ available rather than silently discarding it.
   then runs as its own turn rather than joining the running one, so each
   message keeps its own attribution. When Codex uses its built-in provider, or
   runs on another machine, its turns run without that context, and Activity
-  shows "Ran without the Buzz context" with the reason.
+  shows "Ran without the Buzz context" with the reason. Those messages still
+  wait for the running turn rather than joining it.
 - **Activity**, where the agent type provides it, shows sessions and their
   transcripts in the agent's profile. Once goose agents run through the agent
   gateway, a goose turn woken in a conversation by a plugin, watch or timer

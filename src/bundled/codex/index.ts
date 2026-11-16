@@ -14,7 +14,7 @@ import { CodexProvider, createTabs } from "./tabs";
 import { readUsage } from "./usage";
 import { reviewModel } from "./security-review";
 import { AppServer, listModels } from "./rpc";
-import { HARNESS } from "./gateway";
+import { CODEX_ROUTES, HARNESS } from "./gateway";
 /** Whether Codex declares its harness to the gateway, which sends the Buzz
  * context on turns its own configuration routes there and gates compaction
  * on the route. Off until its wire proof. */
@@ -75,6 +75,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
     undefined,
     ctx.host,
     (pubkey) => ctx.agents.handle(pubkey),
+    // Off, nothing of Codex's reads the gateway's routes, compaction included.
+    GATEWAY ? CODEX_ROUTES : undefined,
   );
   ctx.agentProtection.registerModels({
     label: "Codex",
