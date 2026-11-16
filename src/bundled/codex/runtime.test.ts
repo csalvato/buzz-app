@@ -6920,6 +6920,35 @@ describe("voice seats", () => {
     });
     await connection.close();
   });
+  it("keeps the conversation active while its voice seat opens", async () => {
+    const f = fixture();
+    f.huddleChannels.add("channel");
+    const d = f.delivery("hello");
+    const agent = { ...d.agent, config: d.config } as unknown as Agent;
+    const starting = deferred<void>();
+    f.held.set("thread/start", starting.promise);
+    const opening = f.runtime.voice(
+      {
+        config: d.config,
+        agent,
+        conversation: { channelId: "channel" },
+        signal: new AbortController().signal,
+        async output() {},
+        async transcript() {},
+        ended() {},
+      },
+      d.agent,
+    );
+    await vi.waitFor(() =>
+      expect(f.sent.some((wire) => wire.method === "thread/start")).toBe(true),
+    );
+    expect(f.runtime.sessionState(agent, { channelId: "channel" })).toBe(
+      "active",
+    );
+    starting.resolve();
+    const connection = await opening;
+    await connection.close();
+  });
   it("closes a late media open after the seat was aborted", async () => {
     const pending = deferred<Awaited<ReturnType<typeof openVoice>>>();
     const entered = deferred<void>();

@@ -1735,13 +1735,18 @@ export class CodexRuntime {
         });
         return { input: media.input, close };
       });
-    // Reserve startup in the ordinary lane; later text work waits for it.
-    lane.tail = opening.then(
+    // Reserve startup in the ordinary lane; later text work waits for it,
+    // and the conversation is busy until it settles.
+    lane.pending++;
+    const opened = opening.finally(() => {
+      lane.pending--;
+    });
+    lane.tail = opened.then(
       () => {},
       () => {},
     );
     try {
-      return await opening;
+      return await opened;
     } catch (error) {
       await close();
       throw error;
