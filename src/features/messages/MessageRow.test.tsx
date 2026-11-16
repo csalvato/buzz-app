@@ -5380,3 +5380,45 @@ it("words a thread's draft by its replies even while an activity line hides thei
   ).toHaveTextContent(/^Draft reply$/);
   fresh.unmount();
 });
+
+it.each([true, false])(
+  "renders one timestamp for a timed forward with seeking=%s",
+  (canSeek) => {
+    const seek = vi.fn();
+    const note = "⏱ 0:21 — **Review** this cut";
+    const snapshot = {
+      id: "a".repeat(64),
+      channelId: "source",
+      authorId: "b".repeat(64),
+      authorName: "Original Author",
+      createdAt: 1,
+      content: "Copied content",
+    };
+    const view = renderMessage({
+      row: {
+        ...row,
+        content:
+          note +
+          "\n\nForwarded message from Original Author\n\n> Copied content",
+        forward: { note, snapshot },
+      },
+      ...(canSeek ? { onMediaTime: seek } : {}),
+    });
+    try {
+      expect(screen.getByText("Review").tagName).toBe("STRONG");
+      expect(view.container).toHaveTextContent("Review this cut");
+      expect(view.container).toHaveTextContent("Copied content");
+      expect(view.container.textContent?.match(/0:21/g)).toHaveLength(1);
+      expect(view.container).not.toHaveTextContent("⏱");
+      if (canSeek) {
+        fireEvent.click(screen.getByRole("button", { name: "0:21" }));
+        expect(seek).toHaveBeenCalledExactlyOnceWith(21);
+      } else {
+        expect(screen.queryByRole("button", { name: "0:21" })).toBeNull();
+        expect(screen.getByText("0:21").tagName).toBe("SPAN");
+      }
+    } finally {
+      view.unmount();
+    }
+  },
+);
