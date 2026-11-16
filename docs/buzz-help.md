@@ -516,13 +516,13 @@ available rather than silently discarding it.
   Claude's settings at each new turn, so an edited endpoint or header counts
   from the next turn; when attribution stops, Buzz puts back the person's
   current headers. Buzz never changes Claude's endpoint, sign-in or provider.
-  A turn that can't be attributed (another endpoint or provider, settings
-  Claude didn't report or take, a managed policy's or another tool's Claude
-  settings, which Buzz leaves alone, or custom headers set only in the
-  environment Buzz was started from, which Buzz leaves as they are; Claude
-  itself doesn't go back to those once a settings file's headers are removed)
-  still runs, and Activity notes "Not attributed in the agent gateway" with
-  the reason. Protected Claude agents are not attributed yet: their pinned
+  A turn that can't be attributed still runs, and Activity notes "Not
+  attributed in the agent gateway" with the reason. That happens with another
+  endpoint or provider, settings Claude didn't report or take, or a managed
+  policy's or another tool's Claude settings, which Buzz leaves alone. It
+  also happens when custom headers are set only in the environment Buzz was
+  started from; Buzz leaves those as they are, and Claude itself doesn't go
+  back to them once a settings file's headers are removed. Protected Claude agents are not attributed yet: their pinned
   launch ignores Claude's settings files, including a gateway app's.
 - **Activity**, where the agent type provides it, shows sessions and their
   transcripts in the agent's profile. A turn's **Thread** or **Channel** label
