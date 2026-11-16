@@ -3208,11 +3208,11 @@ export class CodexRuntime {
       const status = await followed.completed;
       signal.throwIfAborted();
       // A message that began the next turn has taken over the lane's status.
-      const mine = lane.active === active;
+      const mine = () => lane.active === active;
       if (status === "interrupted" && active.stopped) {
         for (const taken of active.requests) taken.answered(true);
         await this.terminals(rpc, active.threadId, STOP_LINGER_MS);
-        if (mine) this.status(agent.key, key, "Stopped");
+        if (mine()) this.status(agent.key, key, "Stopped");
       } else if (status === "interrupted") {
         for (const taken of active.requests)
           taken.failActivity("Codex’s turn was interrupted");
@@ -3221,7 +3221,7 @@ export class CodexRuntime {
           active.reply,
           "Codex’s turn was interrupted. Send another mention to continue.",
         );
-        if (mine) this.status(agent.key, key, "Interrupted");
+        if (mine()) this.status(agent.key, key, "Interrupted");
       } else {
         const failed = active.requests.find(
           (taken) => taken.finalDelivery instanceof Error,
@@ -3229,7 +3229,7 @@ export class CodexRuntime {
         if (failed instanceof Error) throw failed;
         // A turn may end without a reply when there is nothing new to say.
         for (const taken of active.requests) taken.answered();
-        if (mine) this.status(agent.key, key, "Idle");
+        if (mine()) this.status(agent.key, key, "Idle");
       }
     } catch (error) {
       // Refused before any turn began, it took nothing in.
