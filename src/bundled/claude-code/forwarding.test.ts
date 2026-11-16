@@ -26,6 +26,7 @@ import {
   type ForwardRetry,
   type Generation,
   HARNESS,
+  configured,
   type Inherited,
   MANAGED_UNREADABLE,
   managedRefusal,
@@ -83,9 +84,10 @@ function harness(
   answers: ForwardOpened[] = [],
   retry: ForwardRetry = { delays: [] },
   managed: () => Promise<readonly string[]> = async () => [],
-  inherited: () => Promise<Inherited> = async () => ({
+  inherited: (folder: string | undefined) => Promise<Inherited> = async () => ({
     lists: ["", ""],
     proxied: false,
+    settings: [],
   }),
 ) {
   let route: GatewayRoute = eligible(2);
@@ -270,6 +272,50 @@ describe("managedRouting", () => {
   });
 });
 
+describe("configured", () => {
+  const file = (env: Record<string, unknown>) => JSON.stringify({ env });
+  it("takes each no-proxy list from the last settings file to set it, else the inherited one", () => {
+    const inherited = {
+      lists: ["corp.example", "lower.example"],
+      proxied: false,
+    };
+    expect(configured({ ...inherited, settings: [] })).toEqual(inherited);
+    expect(
+      configured({
+        ...inherited,
+        settings: [
+          file({ NO_PROXY: "user.example" }),
+          "",
+          "not json",
+          JSON.stringify([]),
+          file({ NO_PROXY: "local.example", OTHER: "1" }),
+        ],
+      }),
+    ).toEqual({ lists: ["local.example", "lower.example"], proxied: false });
+    // Set empty, it replaces the inherited list with none.
+    expect(
+      configured({ ...inherited, settings: [file({ no_proxy: "" })] }),
+    ).toEqual({ lists: ["corp.example", ""], proxied: false });
+  });
+
+  it("counts a proxy a settings file sets", () => {
+    const direct = { lists: ["", ""], proxied: false };
+    expect(
+      configured({ ...direct, settings: [file({ HTTP_PROXY: " " })] }).proxied,
+    ).toBe(false);
+    for (const proxy of ["HTTPS_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"])
+      expect(
+        configured({
+          ...direct,
+          settings: [file({ [proxy]: "http://p:8080" })],
+        }).proxied,
+      ).toBe(true);
+    expect(configured({ ...direct, proxied: true, settings: [] }).proxied).toBe(
+      true,
+    );
+  });
+});
+
 describe("noProxy", () => {
   it("joins both inherited lists once each, with loopback added", () => {
     expect(noProxy(["", ""])).toBe("127.0.0.1,localhost");
@@ -317,7 +363,11 @@ describe("ClaudeForwarding.open", () => {
       [],
       { delays: [] },
       async () => [],
-      async () => ({ lists: ["corp.example", ".internal"], proxied: true }),
+      async () => ({
+        lists: ["corp.example", ".internal"],
+        proxied: true,
+        settings: [],
+      }),
     );
     const generation = await proxied.forwarding.open(
       AGENT,
@@ -343,6 +393,40 @@ describe("ClaudeForwarding.open", () => {
     expect(unreadable.calls).toEqual([]);
   });
 
+  it("keeps the hosts the folder's settings files name, with loopback, in the generation's lists", async () => {
+    const inherited = vi.fn(async (_folder: string | undefined) => ({
+      lists: ["inherited.example", ""],
+      proxied: true,
+      settings: [JSON.stringify({ env: { NO_PROXY: "corp.example" } })],
+    }));
+    const h = harness([], { delays: [] }, async () => [], inherited);
+    const generation = await h.forwarding.open(
+      AGENT,
+      eligible(2),
+      { ...turn, folder: "~/agent" },
+      signal,
+    );
+    expect(inherited).toHaveBeenCalledWith("~/agent");
+    expect(generation.noProxy).toBe("corp.example,127.0.0.1,localhost");
+  });
+
+  it("refuses a managed no-proxy list that misses the generation under a proxy a settings file sets", async () => {
+    const h = harness(
+      [],
+      { delays: [] },
+      async () => [JSON.stringify({ env: { NO_PROXY: "corp.example" } })],
+      async () => ({
+        lists: ["", ""],
+        proxied: false,
+        settings: [JSON.stringify({ env: { HTTPS_PROXY: "http://p:8080" } })],
+      }),
+    );
+    await expect(
+      h.forwarding.open(AGENT, eligible(2), turn, signal),
+    ).rejects.toThrow(managedRefusal("NO_PROXY"));
+    expect(h.calls).toEqual([]);
+  });
+
   it("refuses a managed no-proxy list that misses the generation only under a proxy", async () => {
     const managed = async () => [
       JSON.stringify({ env: { NO_PROXY: "corp.example" } }),
@@ -350,6 +434,7 @@ describe("ClaudeForwarding.open", () => {
     const proxied = harness([], { delays: [] }, managed, async () => ({
       lists: ["", ""],
       proxied: true,
+      settings: [],
     }));
     await expect(
       proxied.forwarding.open(AGENT, eligible(2), turn, signal),
@@ -792,7 +877,12 @@ describe("forwarded turns in a conversation", () => {
     await flush();
     const process = nth(claudes());
     expect(settingsOf(process)).toBe(
-      JSON.stringify({ env: forwardEnv("http://127.0.0.1:9/g1") }),
+      JSON.stringify({
+        env: forwardEnv({
+          url: "http://127.0.0.1:9/g1",
+          noProxy: "127.0.0.1,localhost",
+        }),
+      }),
     );
     expect(process.options.args).toEqual(
       expect.arrayContaining(["--session-id", "new-1"]),

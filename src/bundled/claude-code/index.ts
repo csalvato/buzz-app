@@ -90,9 +90,9 @@ export const apply: PluginModule["apply"] = (ctx) => {
               managedFolder(/Mac/i.test(navigator.platform)),
             );
           },
-          async () => {
+          async (folder) => {
             if (!spawn) throw new Error("No host to read proxy exceptions");
-            return readNoProxy(spawn);
+            return readNoProxy(spawn, folder);
           },
         )
       : undefined,

@@ -3025,10 +3025,16 @@ function gateway(
       opens[id - 1]?.onEvent({ type: "closed" });
     }),
   };
+  // Records the folder each open reads settings files in.
+  const inherited = vi.fn(async (_folder: string | undefined) => ({
+    lists: ["", ""],
+    proxied: false,
+    settings: [],
+  }));
   const forwarding = new ClaudeForwarding(
     { id: "buzz.claude-code", revision: "r1" },
     async () => [],
-    async () => ({ lists: ["", ""], proxied: false }),
+    inherited,
     native,
     {
       routeFor: () => route,
@@ -3036,7 +3042,7 @@ function gateway(
       invalidateRoute: () => {},
     },
   );
-  return { forwarding, opens, calls, native };
+  return { forwarding, opens, calls, native, inherited };
 }
 const gatewayIdentity = {
   community_id: "11111111-2222-4333-8444-555555555555",
@@ -3235,6 +3241,8 @@ it("forwards a dispatched gateway turn at the route it was dispatched with", asy
   expect(args[args.indexOf("--settings") + 1]).toContain(
     "http://127.0.0.1:9/h",
   );
+  // Its folder's settings files are read for the proxy exceptions they set.
+  expect(g.inherited.mock.calls).toEqual([["~/.buzz"]]);
   claude?.finish();
   await Promise.all(f.workingUntil.mock.calls.map(([done]) => done));
 });
@@ -3295,6 +3303,8 @@ it("forwards a protected agent's gateway turn on its protected launch, reviews i
     "http://127.0.0.1:9/h",
   );
   expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
+  // So no folder's settings files are read for proxy exceptions either.
+  expect(g.inherited.mock.calls).toEqual([[undefined]]);
   expect(args).toContain("--strict-mcp-config");
   try {
     worker.emit({

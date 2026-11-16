@@ -64,7 +64,8 @@ export type ClaudeLaunch = Readonly<{
   /** The gateway forwarding URL this process's inference goes to: one
    * turn's generation, fixed for the process's life. `--settings` env wins
    * over the person's own settings and merges the rest. `noProxy` is its
-   * NO_PROXY and no_proxy, the person's own with the URL's host added. */
+   * NO_PROXY and no_proxy, the person's own, their settings' included, with
+   * the URL's host added. */
   forward?: Readonly<{ url: string; noProxy: string }>;
   /** The in-process MCP server's tools. */
   tools?: ToolServer;
@@ -140,13 +141,19 @@ export const ENDPOINTS = [
   "ANTHROPIC_AWS_BASE_URL",
   "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
 ] as const;
-/** A forwarded process's `--settings` env: its generation's URL, and every
- * provider and other endpoint blanked. Flag settings outrank the user's,
- * the project's and the local ones, whose `env` would otherwise apply after
- * launch; only managed settings outrank them. */
-export const forwardEnv = (url: string): Record<string, string> => ({
+/** A forwarded process's `--settings` env: its generation's URL, every
+ * provider and other endpoint blanked, and its no-proxy lists, which keep
+ * the hosts the person's own settings name. Flag settings outrank the
+ * user's, the project's and the local ones, whose `env` would otherwise
+ * apply after launch; only managed settings outrank them. */
+export const forwardEnv = ({
+  url,
+  noProxy,
+}: Readonly<{ url: string; noProxy: string }>): Record<string, string> => ({
   ...Object.fromEntries([...PROVIDERS, ...ENDPOINTS].map((name) => [name, ""])),
   ANTHROPIC_BASE_URL: url,
+  NO_PROXY: noProxy,
+  no_proxy: noProxy,
 });
 
 export const ENV: Readonly<Record<string, string | null>> = {
@@ -335,10 +342,7 @@ export class ClaudeProcess {
           : []),
         ...(launch.effort ? ["--effort", launch.effort] : []),
         ...(launch.forward
-          ? [
-              "--settings",
-              JSON.stringify({ env: forwardEnv(launch.forward.url) }),
-            ]
+          ? ["--settings", JSON.stringify({ env: forwardEnv(launch.forward) })]
           : []),
         ...(launch.resume ? ["--resume", launch.resume] : []),
         ...(!launch.resume && launch.sessionId
@@ -403,8 +407,8 @@ export class ClaudeProcess {
                 [...PROVIDERS, ...ENDPOINTS].map((name) => [name, null]),
               ),
               CLAUDE_CODE_REMOTE_SESSION_ID: null,
-              // In the process env, not flag settings, where it would replace
-              // a list the person's settings give their other hosts.
+              // Also in its flag settings, over the person's own settings,
+              // whose hosts it holds.
               NO_PROXY: launch.forward.noProxy,
               no_proxy: launch.forward.noProxy,
             }

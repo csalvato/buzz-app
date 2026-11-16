@@ -10,8 +10,10 @@
 #   review                           prints their folder, then that sign-in
 #   managed FOLDER                   prints each managed settings file
 #                                    Claude reads there, base64, one per line
-#   no-proxy                         prints NO_PROXY and no_proxy, base64,
-#                                    one per line, then whether a proxy is set
+#   no-proxy [FOLDER]                prints NO_PROXY and no_proxy, base64,
+#                                    one per line, then whether a proxy is set;
+#                                    with FOLDER, then each settings file
+#                                    Claude reads for it, base64 or empty
 set -eu
 
 # Shared by every Buzz build on this computer, so there is one download.
@@ -197,6 +199,23 @@ no-proxy)
   else
     echo direct
   fi
+  # With an agent's folder $1: its user, project and local settings, in the
+  # order Claude merges them, empty where absent. Their env applies after
+  # launch, over this one. A file it can't read fails the step.
+  [ $# -gt 0 ] || exit 0
+  folder="$1"
+  case "$folder" in
+  "~") folder="$HOME" ;;
+  "~/"*) folder="$HOME/${folder#\~/}" ;;
+  esac
+  for file in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
+    "$folder/.claude/settings.json" "$folder/.claude/settings.local.json"; do
+    if [ -f "$file" ]; then
+      encoded=$(base64 <"$file") || exit 1
+      printf '%s' "$encoded" | tr -d '\n'
+    fi
+    echo
+  done
   ;;
 *)
   echo "Unknown command: $command" >&2

@@ -1059,9 +1059,9 @@ it("reads managed settings files from claude.sh, and fails when it can't", async
 
 it("reads the inherited no-proxy lists from claude.sh, and fails when it can't", async () => {
   const answering =
-    (code: number, stdout: string, stderr = ""): Spawn =>
+    (code: number, stdout: string, stderr = "", args: string[] = []): Spawn =>
     async (id, options) => {
-      expect([id, options?.args]).toEqual(["no-proxy", []]);
+      expect([id, options?.args]).toEqual(["no-proxy", args]);
       queueMicrotask(() => {
         options?.onStdout?.(stdout);
         if (stderr) options?.onStderr?.(stderr);
@@ -1075,11 +1075,32 @@ it("reads the inherited no-proxy lists from claude.sh, and fails when it can't",
     };
   await expect(
     readNoProxy(answering(0, `${btoa("corp.example")}\n\nproxied\n`)),
-  ).resolves.toEqual({ lists: ["corp.example", ""], proxied: true });
+  ).resolves.toEqual({
+    lists: ["corp.example", ""],
+    proxied: true,
+    settings: [],
+  });
   await expect(readNoProxy(answering(0, "\n\ndirect\n"))).resolves.toEqual({
     lists: ["", ""],
     proxied: false,
+    settings: [],
   });
+  // With a folder: its user, project and local settings, empty where absent.
+  const user = '{"env":{"NO_PROXY":"corp.example"}}';
+  await expect(
+    readNoProxy(
+      answering(0, `\n\ndirect\n${btoa(user)}\n\n\n`, "", ["~/agent"]),
+      "~/agent",
+    ),
+  ).resolves.toEqual({
+    lists: ["", ""],
+    proxied: false,
+    settings: [user, "", ""],
+  });
+  // Without all three, it can't say what they set.
+  await expect(
+    readNoProxy(answering(0, "\n\ndirect\n\n", "", ["~/agent"]), "~/agent"),
+  ).rejects.toThrow("The proxy exceptions are unreadable");
   // Cut short, it can't say whether a proxy applies.
   await expect(readNoProxy(answering(0, "\n\n"))).rejects.toThrow(
     "The proxy exceptions are unreadable",

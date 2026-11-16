@@ -853,10 +853,20 @@ export class ClaudeRuntime {
         standalone ? "standalone" : "resume",
       );
       if (!bound.ok) throw new Error(bound.message);
+      // A protected launch reads no settings files, so only an unprotected
+      // one's folder is read for the proxy exceptions they set.
+      const entry = this.agents.get(agent);
+      const folder =
+        entry && !entry.protected ? entry.config.workspace : undefined;
       const generation = await this.forwarding.open(
         agent,
         gateway.route,
-        { binding: bound.binding, context: gateway.turn, session },
+        {
+          binding: bound.binding,
+          context: gateway.turn,
+          session,
+          ...(folder === undefined ? {} : { folder }),
+        },
         signal,
       );
       return { generation, binding: bound.binding };

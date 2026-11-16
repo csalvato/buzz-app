@@ -279,7 +279,8 @@ it("clears what would pick another provider or endpoint for a forwarded process"
   // The person's own sign-in still reaches the gateway.
   expect(env).not.toHaveProperty("ANTHROPIC_AUTH_TOKEN");
   // Their settings' `env` applies after launch; flag settings outrank it,
-  // blanking every provider and endpoint but the generation's.
+  // blanking every provider and endpoint but the generation's, and keeping
+  // the no-proxy lists, which hold their settings' hosts.
   const args = processes[0]?.options.args ?? [];
   const settings = JSON.parse(args[args.indexOf("--settings") + 1] ?? "{}");
   expect(settings).toEqual({
@@ -288,6 +289,8 @@ it("clears what would pick another provider or endpoint for a forwarded process"
         [...PROVIDERS, ...ENDPOINTS].map((name) => [name, ""]),
       ),
       ANTHROPIC_BASE_URL: "http://127.0.0.1:9/h",
+      NO_PROXY: "corp,127.0.0.1",
+      no_proxy: "corp,127.0.0.1",
     },
   });
   for (const name of [

@@ -611,3 +611,45 @@ it("prints the inherited no-proxy lists and whether a proxy is set, never the pr
     expect(stdout).not.toContain(Buffer.from(secret).toString("base64"));
   }
 });
+
+it("prints a folder's user, project and local settings after the no-proxy lists", async () => {
+  const { home } = await disk([]);
+  const read = async (folder: string, env: Record<string, string> = {}) =>
+    (
+      await run("bash", ["-c", script, "claude.sh", "no-proxy", folder], {
+        env: { PATH: process.env.PATH ?? "", HOME: home, ...env },
+      })
+    ).stdout
+      .split("\n")
+      .slice(3, -1)
+      .map((line) => Buffer.from(line, "base64").toString("utf8"));
+  // None yet: one empty line each.
+  expect(await read("~/agent")).toEqual(["", "", ""]);
+  const user = '{"env":{"NO_PROXY":"user.é"}}';
+  const project = '{"env":{"NO_PROXY":"project.example"}}';
+  const local = '{"env":{"no_proxy":"local.example"}}';
+  await mkdir(join(home, ".claude"), { recursive: true });
+  await writeFile(join(home, ".claude/settings.json"), user);
+  await mkdir(join(home, "agent/.claude"), { recursive: true });
+  await writeFile(join(home, "agent/.claude/settings.json"), project);
+  await writeFile(join(home, "agent/.claude/settings.local.json"), local);
+  // A folder under home, as agents' workspaces are given, or a full path.
+  expect(await read("~/agent")).toEqual([user, project, local]);
+  expect(await read(join(home, "agent"))).toEqual([user, project, local]);
+  // The user settings follow CLAUDE_CONFIG_DIR, as Claude's do.
+  const config = join(home, "config");
+  await mkdir(config);
+  expect(await read("~/agent", { CLAUDE_CONFIG_DIR: config })).toEqual([
+    "",
+    project,
+    local,
+  ]);
+  // One it can't read fails the step rather than passing it over.
+  await chmod(join(home, "agent/.claude/settings.json"), 0o000);
+  if (process.getuid?.() !== 0)
+    await expect(
+      run("bash", ["-c", script, "claude.sh", "no-proxy", "~/agent"], {
+        env: { PATH: process.env.PATH ?? "", HOME: home },
+      }),
+    ).rejects.toThrow();
+});

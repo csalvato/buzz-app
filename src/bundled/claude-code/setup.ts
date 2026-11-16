@@ -178,21 +178,37 @@ export async function readManaged(spawn: Spawn, folder: string) {
   return stdout.split("\n").filter(Boolean).map(decode);
 }
 
+/** The user, project and local settings files `no-proxy` prints for a
+ * folder. */
+const SETTINGS_FILES = 3;
+
 /** NO_PROXY and no_proxy as Claude's processes inherit them from the app,
- * empty where unset, and whether they inherit a proxy. */
-export async function readNoProxy(spawn: Spawn): Promise<Inherited> {
-  const { code, stdout, stderr } = await collect(spawn, "no-proxy", []);
-  const [upper, lower, proxy] = stdout.split("\n");
+ * empty where unset, and whether they inherit a proxy; with `folder`, the
+ * settings files a process started there reads, in merge order, empty where
+ * absent. */
+export async function readNoProxy(
+  spawn: Spawn,
+  folder?: string,
+): Promise<Inherited> {
+  const { code, stdout, stderr } = await collect(
+    spawn,
+    "no-proxy",
+    folder === undefined ? [] : [folder],
+  );
+  const [upper, lower, proxy, ...files] = stdout.split("\n");
+  const settings = folder === undefined ? [] : files.slice(0, SETTINGS_FILES);
   if (
     code !== 0 ||
     upper === undefined ||
     lower === undefined ||
-    (proxy !== "proxied" && proxy !== "direct")
+    (proxy !== "proxied" && proxy !== "direct") ||
+    settings.length < (folder === undefined ? 0 : SETTINGS_FILES)
   )
     throw new Error(stderr.trim() || "The proxy exceptions are unreadable");
   return {
     lists: [decode(upper), decode(lower)],
     proxied: proxy === "proxied",
+    settings: settings.map(decode),
   };
 }
 

@@ -65,7 +65,8 @@ export type Generation = Readonly<{
   /** Whether native admitted any request on it: one that never did, once
    * a turn has run, means Claude's requests went somewhere else. */
   admitted(): boolean;
-  /** Its process's NO_PROXY and no_proxy: the inherited ones with the
+  /** Its process's NO_PROXY and no_proxy: the ones in effect for it, the
+   * inherited ones or those its settings files set over them, with the
    * generation's loopback address added, so a proxy never gets its
    * requests. */
   noProxy: string;
@@ -160,11 +161,48 @@ export function managedRouting(
 }
 
 /** NO_PROXY and no_proxy as Claude's processes inherit them, and whether
- * they inherit a proxy, whose value (it may hold a password) is never read. */
+ * they inherit a proxy, whose value (it may hold a password) is never read;
+ * and the user, project and local settings files a process reads, in merge
+ * order, empty where absent: none for a process that reads no settings
+ * files. */
 export type Inherited = Readonly<{
   lists: readonly string[];
   proxied: boolean;
+  settings: readonly string[];
 }>;
+
+/** The no-proxy lists in effect for a process, `inherited`'s or the last
+ * settings file's to set each name, as a settings `env` applies over the
+ * process env after launch; and whether a proxy applies, inherited or set
+ * there. A file that isn't a settings object is skipped, as Claude skips
+ * it. */
+export function configured({ lists, proxied, settings }: Inherited): Readonly<{
+  lists: readonly string[];
+  proxied: boolean;
+}> {
+  const effective = Object.fromEntries(
+    NO_PROXY.map((name, index) => [name, lists[index] ?? ""]),
+  );
+  let proxy = proxied;
+  for (const file of settings) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(file);
+    } catch {
+      continue;
+    }
+    const env = (parsed as { env?: unknown } | null)?.env;
+    if (!env || typeof env !== "object") continue;
+    const own = env as Record<string, unknown>;
+    for (const name of NO_PROXY)
+      if (name in own) effective[name] = String(own[name] ?? "");
+    proxy ||= PROXIES.some((name) => String(own[name] ?? "").trim() !== "");
+  }
+  return {
+    lists: NO_PROXY.map((name) => effective[name] ?? ""),
+    proxied: proxy,
+  };
+}
 
 export const BYPASSED =
   "This turn's model requests didn't go through the agent gateway, so it failed. Claude's own settings may send them elsewhere.";
@@ -178,10 +216,13 @@ export class ClaudeForwarding {
     /** The managed settings files Claude reads, in merge order: required,
      * so nothing opens without checking them. */
     private readonly managed: () => Promise<readonly string[]>,
-    /** NO_PROXY and no_proxy as Claude's processes inherit them, and
-     * whether a proxy does: required, so no forwarded process drops the
-     * person's own. */
-    private readonly inherited: () => Promise<Inherited>,
+    /** NO_PROXY and no_proxy as Claude's processes inherit them, whether
+     * a proxy does, and the settings files a process started in `folder`
+     * reads (none without one): required, so no forwarded process drops
+     * the person's own. */
+    private readonly inherited: (
+      folder: string | undefined,
+    ) => Promise<Inherited>,
     private readonly native: ForwardNative = NATIVE,
     private readonly routes: ForwardRoutes = ROUTES,
     private readonly retry: ForwardRetry = RETRY,
@@ -216,6 +257,8 @@ export class ClaudeForwarding {
       binding: GatewayBinding;
       context: TurnContext;
       session: string;
+      /** Where its process starts, when that process reads settings files. */
+      folder?: string;
     }>,
     signal: AbortSignal,
   ): Promise<Generation> {
@@ -235,9 +278,9 @@ export class ClaudeForwarding {
       console.warn("Claude's managed settings are unreadable", error);
       throw new Error(MANAGED_UNREADABLE);
     }
-    let inherited: Inherited;
+    let inherited: ReturnType<typeof configured>;
     try {
-      inherited = await this.inherited();
+      inherited = configured(await this.inherited(turn.folder));
     } catch (error) {
       console.warn("The proxy exceptions are unreadable", error);
       throw new Error(NO_PROXY_UNREADABLE);
