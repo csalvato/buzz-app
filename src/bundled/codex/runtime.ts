@@ -83,9 +83,9 @@ import {
 } from "./rpc";
 import { findConversation } from "./transcript";
 import {
-  bindingAdmits,
   bindSession,
   inferenceBundle,
+  type Checked,
   type GatewayBinding,
   type TurnContext,
 } from "../../features/agents/gateway/contract";
@@ -95,17 +95,12 @@ import {
 } from "../../features/agents/gateway/forwarding";
 import { fallbackNotice } from "../../features/agents/gateway/route";
 import {
-  COMPACT_GATEWAY,
-  COMPACT_ORDINARY,
   controlRoute,
-  FROM_GATEWAY,
   gatewayProvider,
   NO_PROVIDER,
   REMOTE_UNATTRIBUTED,
-  ROUTE_CHANGED,
   threadConfig,
-  TO_GATEWAY,
-  UNCERTAIN,
+  unattributed,
   type CodexGateway,
   type CodexRoute,
   type CodexRoutes,
@@ -170,9 +165,9 @@ type Saved = {
   /** A lost first-turn response must not be treated as an empty session. */
   pending?: true;
   protection?: string;
-  /** The Buzz session of a thread that ran through the agent gateway;
-   * absent for an ordinary thread. A thread resumes only in the mode it ran
-   * in: Codex keeps a thread on the provider it started with. */
+  /** The Buzz session of a thread that has run through the agent gateway;
+   * a later gateway turn of the thread continues it. A thread resumes in
+   * either mode: each resume sets, or drops, the Buzz headers. */
   gateway?: GatewayBinding;
 };
 type Active = {
@@ -197,12 +192,10 @@ type Active = {
   requests: Request[];
   /** Latest acknowledged mention per Buzz thread; independent of session scope. */
   activity: Map<string, Request>;
-  /** A gateway turn's route revision and frozen context: a request steers
-   * into it only with exactly these, so nothing is sent under another
-   * delivery's IDs. */
+  /** The first delivery's gateway route revision, channel and thread: a
+   * request steers in only with the same ones, and then runs under the
+   * turn's frozen headers. */
   gateway?: string | undefined;
-  /** The turn the thread's `turn/completed` reported, once it has. */
-  completedId?: string;
 };
 /** A watch or timer turn on an ephemeral thread of its own. Its tools have
  * no default destination and it answers no request. */
@@ -244,9 +237,6 @@ type Server = {
   /** Starts a turn of a thread. What it returns takes why the provider refused
    * that turn's model input, if it said. */
   explainer?(threadId: string): () => string | undefined;
-  /** Gateway threads this process left uncertain: a turn whose end wasn't
-   * seen, or a release Codex didn't confirm. None resumes on this process. */
-  uncertain: Set<string>;
 };
 export type SessionView = { key: string; status: string; detail: string };
 /** A saved binding, newest first, for the owner's transcript list, with the
@@ -685,81 +675,49 @@ export class CodexRuntime {
       const { bridge } = prepared;
       let { params } = prepared;
       // Through the gateway where the agent's turns go, under the control's
-      // own context, and only for a thread that ran there.
+      // own context and the thread's Buzz session.
       const gateway = control?.gateway;
       const headed = this.gatewayParams(prepared, gateway);
-      const routed = headed ? gateway : undefined;
-      if (routed && !thread.gateway) {
-        await bridge?.close();
-        throw new Error(COMPACT_ORDINARY);
-      }
-      if (!routed && thread.gateway) {
-        await bridge?.close();
-        throw new Error(COMPACT_GATEWAY);
-      }
-      if (routed && server.uncertain.has(thread.threadId)) {
-        await bridge?.close();
-        throw new Error(UNCERTAIN);
-      }
-      const routeAbort = new AbortController();
-      const stopped = AbortSignal.any([signal, routeAbort.signal]);
-      let unwatch: (() => void) | undefined;
-      /** Whether compaction ended as Codex reported, or never started. */
-      let ended = true;
-      /** Codex refused a step: nothing started, and it may have let go. */
-      let refused = false;
       try {
-        if (routed && headed) {
-          unwatch = this.stayOnRoute(agent.key, routed, (error) =>
-            routeAbort.abort(error),
+        if (gateway && headed) {
+          const bound = continueSession(gateway.route, thread.gateway);
+          if (bound.persist) {
+            entry.saved[key] = { ...thread, gateway: bound.binding };
+            await this.storage.set(
+              entry.storageKey,
+              JSON.stringify(entry.saved),
+            );
+          }
+          const routed = headed(
+            bound.binding,
+            controlTurn(place, settings.scope),
           );
-          const bound = bindSession(routed.route, thread.gateway, "resume");
-          if (!bound.ok) throw new Error(bound.message);
-          params = headed(bound.binding, controlTurn(place, settings.scope));
+          // Without its context, compaction still runs.
+          if (routed.ok) params = routed.value;
         }
-        stopped.throwIfAborted();
+        signal.throwIfAborted();
         bridge?.bind(thread.threadId);
         await rpc.request("thread/resume", {
           ...params,
           threadId: thread.threadId,
           excludeTurns: true,
         });
-        stopped.throwIfAborted();
-        ended = false;
-        await this.compact(rpc, stopped, thread.threadId, agent.key, key);
-        ended = true;
+        signal.throwIfAborted();
+        await this.compact(rpc, signal, thread.threadId, agent.key, key);
         this.status(agent.key, key, "Idle");
       } catch (error) {
-        if (error instanceof Refused) ended = refused = true;
         this.status(
           agent.key,
           key,
-          stopped.aborted ? "Interrupted" : "Needs attention",
+          signal.aborted ? "Interrupted" : "Needs attention",
           message(error),
         );
         throw error;
       } finally {
-        unwatch?.();
         await bridge?.close();
-        const released = await rpc
-          .request<{ status?: string }>("thread/unsubscribe", {
-            threadId: thread.threadId,
-          })
+        await rpc
+          .request("thread/unsubscribe", { threadId: thread.threadId })
           .catch(() => undefined);
-        // As a turn's: only a seen end and a confirmed release let the
-        // thread resume here under other IDs.
-        if (
-          routed &&
-          (!ended ||
-            !(
-              releasedCleanly(released) ||
-              // A refused step released it already, or never subscribed.
-              (refused && released?.status === "notSubscribed")
-            ))
-        ) {
-          server.uncertain.add(thread.threadId);
-          this.status(agent.key, key, "Needs attention", UNCERTAIN);
-        }
       }
     });
   }
@@ -1096,7 +1054,6 @@ export class CodexRuntime {
         rpc,
         protection,
         threads: new Map(),
-        uncertain: new Set(),
         opening: Promise.resolve(rpc),
       };
       server.opening = (async () => {
@@ -1178,7 +1135,6 @@ export class CodexRuntime {
         defaults.workspace,
       ),
       threads: new Map(),
-      uncertain: new Set(),
     };
     // An exit fails current work and permits the next ordinary mention to reopen.
     rpc.onMessage((wire) => {
@@ -1614,11 +1570,11 @@ export class CodexRuntime {
                   active.reply.conversation.topLevel ||
                 (request.model && request.model !== active.model) ||
                 (request.effort && request.effort !== active.effort) ||
-                // A gateway turn's requests carry its delivery's context: a
-                // request with any other, or a gateway request into a turn
-                // without that context, runs as its own turn. So does one
-                // that would run unattributed: its provenance is still its
-                // own delivery's.
+                // A steered request runs under the turn's frozen headers,
+                // which name the turn's first message. One routed otherwise,
+                // a gateway delivery into an ordinary turn or the reverse, or
+                // another Buzz thread of a channel-scoped session, runs as its
+                // own turn.
                 gatewayMark(request.gateway) !== active.gateway
               ) {
                 queue();
@@ -1763,15 +1719,9 @@ export class CodexRuntime {
     if (entry.abort.signal.aborted)
       return { ok: false, error: "Codex was stopped" };
     const server = this.open(agent);
-    const routeAbort = new AbortController();
-    const signal = AbortSignal.any([
-      entry.abort.signal,
-      turnSignal,
-      routeAbort.signal,
-    ]);
+    const signal = AbortSignal.any([entry.abort.signal, turnSignal]);
     /** Why this turn ran without the Buzz context, for its Activity status. */
     let notice = delivery.gatewayFallback?.notice;
-    let unwatch: (() => void) | undefined;
     let release!: () => void;
     const once: Once = {
       finished: false,
@@ -1806,15 +1756,17 @@ export class CodexRuntime {
       // Through the gateway when Codex's configuration goes there, in a
       // Buzz session of its own: the thread is never resumed or saved.
       const headed = this.gatewayParams(prepared, delivery.gateway);
-      if (!headed && delivery.gateway) notice = this.unattributed();
+      if (!headed && delivery.gateway) notice = this.unheaded();
       if (headed && delivery.gateway) {
-        const { gateway } = delivery;
-        unwatch = this.stayOnRoute(agent.key, gateway, (error) =>
-          routeAbort.abort(error),
+        const bound = bindSession(
+          delivery.gateway.route,
+          undefined,
+          "standalone",
         );
-        const bound = bindSession(gateway.route, undefined, "standalone");
         if (!bound.ok) throw new Error(bound.message);
-        params = headed(bound.binding, gateway.turn);
+        const routed = headed(bound.binding, delivery.gateway.turn);
+        if (routed.ok) params = routed.value;
+        else notice = unattributed(routed.message);
       }
       const text = await prompt();
       if (text === undefined) return { ok: true };
@@ -1873,7 +1825,6 @@ export class CodexRuntime {
       this.status(agent.key, key, "Needs attention", message(error));
       return { ok: false, error: message(error) };
     } finally {
-      unwatch?.();
       await hookBridge?.close();
       once.finished = true;
       followed.stop();
@@ -2295,17 +2246,6 @@ export class CodexRuntime {
       if (method === "item/completed" && item.type === "agentMessage")
         reply = item.text ?? "";
     });
-    // A stopped title turn is interrupted, not left running.
-    const interrupt = () => {
-      if (turn.threadId && turn.turnId && !turn.finished)
-        void rpc
-          .request("turn/interrupt", {
-            threadId: turn.threadId,
-            turnId: turn.turnId,
-          })
-          .catch(() => undefined);
-    };
-    signal.addEventListener("abort", interrupt, { once: true });
     try {
       const started = await rpc.request<{ thread: { id: string } }>(
         "thread/start",
@@ -2332,21 +2272,17 @@ export class CodexRuntime {
         },
       );
       turn.threadId = started.thread.id;
-      signal.throwIfAborted();
-      const titled = await rpc.request<{ turn: { id: string } }>("turn/start", {
+      await rpc.request("turn/start", {
         threadId: turn.threadId,
         input: input(titlePrompt(text)),
         model: selected.model,
         ...(low ? { effort: "low" } : {}),
         outputSchema: TITLE_SCHEMA,
       });
-      turn.turnId ??= titled.turn.id;
-      if (signal.aborted) interrupt();
       if ((await followed.completed) !== "completed" || stopped.aborted) return;
       const title = (JSON.parse(reply) as { title?: unknown }).title;
       if (typeof title === "string" && title.trim()) named(title.trim());
     } finally {
-      signal.removeEventListener("abort", interrupt);
       followed.stop();
       if (turn.threadId)
         await rpc
@@ -2464,38 +2400,24 @@ export class CodexRuntime {
       !this.target &&
       gatewayProvider(prepared.providers);
     if (!gateway || !provider) return undefined;
-    return (binding: GatewayBinding, turn: TurnContext): Params => {
+    return (binding: GatewayBinding, turn: TurnContext): Checked<Params> => {
       const bundle = inferenceBundle(gateway.route.profile, binding, turn);
-      if (!bundle.ok) throw new Error(bundle.message);
+      if (!bundle.ok) return bundle;
       return {
-        ...prepared.params,
-        config: {
-          ...prepared.params.config,
-          ...threadConfig(gateway, provider, bundle.value),
+        ok: true,
+        value: {
+          ...prepared.params,
+          config: {
+            ...prepared.params.config,
+            ...threadConfig(gateway, provider, bundle.value),
+          },
         },
       };
     };
   }
   /** Why a gateway delivery ran without the Buzz context. */
-  private unattributed() {
+  private unheaded() {
     return this.target ? REMOTE_UNATTRIBUTED : NO_PROVIDER;
-  }
-  /** Watches `gateway`'s route for `agent` from now: `abort` runs once the
-   * route moves past the revision it was dispatched at. */
-  private stayOnRoute(
-    agent: AgentKey,
-    gateway: CodexRoute | undefined,
-    abort: (error: Error) => void,
-  ) {
-    const { routes } = this;
-    if (!gateway || !routes) return undefined;
-    const check = () => {
-      if (routes.routeFor(agent).revision !== gateway.route.revision)
-        abort(new Error(ROUTE_CHANGED));
-    };
-    const off = routes.subscribeRoute(agent, check);
-    check();
-    return off;
   }
   private async execute(
     request: Request,
@@ -2544,12 +2466,7 @@ export class CodexRuntime {
     });
     let hookBridge: Awaited<ReturnType<typeof openHookBridge>> | undefined;
     let explain: (() => string | undefined) | undefined;
-    /** Set for a turn that runs through the gateway. */
-    let gateway: CodexGateway | undefined;
-    let unwatch: (() => void) | undefined;
-    /** Whether `turn/start` may have reached Codex. */
-    let dispatched = false;
-    /** The mode switch or fallback this turn's Activity status shows. */
+    /** Why this turn runs without the Buzz context, for its Activity status. */
     let notice = request.gatewayFallback?.notice;
     try {
       const rpc = await server.opening;
@@ -2560,7 +2477,7 @@ export class CodexRuntime {
       signal.throwIfAborted();
       active.workspace = workspace;
       const saved = entry.saved[key];
-      const kept = resumable(saved, agent.protection);
+      const existing = resumable(saved, agent.protection);
       const prepared = await this.prepare(
         rpc,
         agent,
@@ -2573,25 +2490,11 @@ export class CodexRuntime {
       let { params } = prepared;
       hookBridge = bridge;
       // Through the gateway only when Codex's own configuration goes there.
-      const headed = this.gatewayParams(prepared, request.gateway);
-      if (headed) gateway = request.gateway;
-      else if (request.gateway) notice = this.unattributed();
+      // The turn keeps this route; a change applies from the next turn.
+      const { gateway } = request;
+      const headed = this.gatewayParams(prepared, gateway);
+      if (gateway && !headed) notice = this.unheaded();
       active.gateway = gatewayMark(gateway);
-      // It stays on the revision it was routed at; a change stops it.
-      unwatch = this.stayOnRoute(agent.key, gateway, (error) =>
-        turnAbort.abort(error),
-      );
-      signal.throwIfAborted();
-      // A thread resumes only in the mode it ran in. The other mode starts
-      // a new thread, and says so.
-      const switched = kept !== undefined && !kept.gateway !== !gateway;
-      const existing = switched ? undefined : kept;
-      const boundary = gateway ? TO_GATEWAY : FROM_GATEWAY;
-      if (switched) {
-        // Alongside, never instead of, a note that the context is missing.
-        notice = [boundary, notice].filter(Boolean).join(" ");
-        this.status(agent.key, key, "Starting", notice);
-      }
       active.model = model;
       active.effort = effort;
       // Resume restores the thread's tools, so one started with other added
@@ -2600,18 +2503,21 @@ export class CodexRuntime {
       const tools = addedKey(added);
       const resuming =
         existing?.workspace === workspace && (existing.tools ?? "") === tools;
-      if (gateway && resuming && server.uncertain.has(existing.threadId))
-        throw new Error(UNCERTAIN);
       /** The Buzz session a gateway thread runs under. */
-      let binding: GatewayBinding | undefined;
+      let binding = resuming ? existing.gateway : undefined;
       // The whole table replaces the provider's headers on every start and
-      // resume: a resumed thread otherwise keeps its earlier ones.
+      // resume; an ordinary resume after a released gateway turn drops them.
+      const base = params;
       const bind = (event: "resume" | "new_generation") => {
+        // A new thread is a new Buzz session.
+        if (event === "new_generation") binding = undefined;
         if (!gateway || !headed) return;
-        const bound = bindSession(gateway.route, existing?.gateway, event);
-        if (!bound.ok) throw new Error(bound.message);
-        binding = bound.binding;
-        params = headed(binding, gateway.turn);
+        binding = continueSession(gateway.route, binding).binding;
+        const routed = headed(binding, gateway.turn);
+        params = routed.ok ? routed.value : base;
+        notice = routed.ok
+          ? request.gatewayFallback?.notice
+          : unattributed(routed.message);
       };
       bind(resuming ? "resume" : "new_generation");
       type Started = { thread: { id: string; cwd: string } };
@@ -2703,17 +2609,6 @@ export class CodexRuntime {
         memory,
         this.repositories(request.scope),
       );
-      // Dispatched only at the revision it was routed at, by a binding the
-      // route still admits.
-      // A headed turn has routes; none, and nothing was routed.
-      if (gateway && binding && this.routes) {
-        const admitted = bindingAdmits(
-          this.routes.routeFor(agent.key),
-          binding,
-        );
-        if (!admitted.ok || admitted.revision !== gateway.route.revision)
-          throw new Error(ROUTE_CHANGED);
-      }
       if (this.target && !resuming)
         await this.save(request, entry, key, {
           pending: true,
@@ -2722,15 +2617,11 @@ export class CodexRuntime {
           at: Date.now(),
           ...(tools ? { tools } : {}),
         });
-      const note = [switched ? boundary : undefined, noteOf(request)]
-        .filter(Boolean)
-        .join("\n\n");
-      dispatched = true;
       const turn = await rpc
         .request<{ turn: { id: string } }>("turn/start", {
           threadId: active.threadId,
           input: input(
-            `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, false, note || undefined, wake, this.reads(request.agent.key)?.authorNames?.(request.event.pubkey))}`,
+            `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, false, noteOf(request), wake, this.reads(request.agent.key)?.authorNames?.(request.event.pubkey))}`,
           ),
           model,
           effort,
@@ -2739,8 +2630,6 @@ export class CodexRuntime {
           additionalContext,
         })
         .catch(async (error: unknown) => {
-          // Refused, it never started.
-          if (error instanceof Refused) dispatched = false;
           if (this.target && !resuming && error instanceof Refused) {
             const { [key]: _, ...saved } = entry.saved;
             await this.storage.set(entry.storageKey, JSON.stringify(saved));
@@ -2770,26 +2659,18 @@ export class CodexRuntime {
         );
       this.acknowledgeActivity(active, request);
       // A conversation new to this agent: name its Solo chat meanwhile.
-      if (request.named && !saved && !server.protection) {
-        // Its title turn carries this turn's headers, so it too stops once
-        // the route moves on; it may outlast the turn itself.
-        const titleAbort = new AbortController();
-        const unwatchTitle = this.stayOnRoute(agent.key, gateway, (error) =>
-          titleAbort.abort(error),
-        );
+      // Its title turn carries this turn's headers.
+      if (request.named && !saved && !server.protection)
         void this.offerTitle(
           rpc,
           request.named,
           text,
-          AbortSignal.any([entry.abort.signal, titleAbort.signal]),
+          entry.abort.signal,
           params,
-        )
-          .catch((error) => {
-            if (!entry.abort.signal.aborted)
-              console.warn("Codex could not title the chat", error);
-          })
-          .finally(() => unwatchTitle?.());
-      }
+        ).catch((error) => {
+          if (!entry.abort.signal.aborted)
+            console.warn("Codex could not title the chat", error);
+        });
       // Empty threads have no resumable rollout until a user turn is accepted.
       await this.save(request, entry, key, {
         threadId: started.thread.id,
@@ -2863,17 +2744,8 @@ export class CodexRuntime {
         );
       }
     } finally {
-      unwatch?.();
       for (const taken of active.requests)
         taken.failActivity("Codex ended without a final reply");
-      // A gateway turn that may have run must be seen to end before its
-      // thread is released: a resume while it runs keeps its headers.
-      const ended =
-        !gateway ||
-        !dispatched ||
-        (active.turnId !== undefined &&
-          (await completion(server.rpc, active, COMPLETION_GRACE_MS)) &&
-          active.completedId === active.turnId);
       followed.stop();
       // A turn Codex took in has ended, however it ended.
       if (active.turnId && !entry.abort.signal.aborted)
@@ -2881,23 +2753,10 @@ export class CodexRuntime {
       turnAbort.abort(new Error("The Codex turn has ended"));
       // Release the subscription before the next resume: loaded-thread rejoin
       // ignores instruction/config overrides while a client is subscribed.
-      if (active.threadId) {
-        const released = await server.rpc
-          .request<{ status?: string }>("thread/unsubscribe", {
-            threadId: active.threadId,
-          })
-          .catch(() => {
-            void server.rpc.close();
-            return undefined;
-          });
-        // Only a confirmed release after a seen end lets the thread resume
-        // here under other IDs; anything else leaves it unavailable.
-        if (gateway && (!ended || !releasedCleanly(released))) {
-          server.uncertain.add(active.threadId);
-          if (!entry.abort.signal.aborted)
-            this.status(agent.key, key, "Needs attention", UNCERTAIN);
-        }
-      }
+      if (active.threadId)
+        await server.rpc
+          .request("thread/unsubscribe", { threadId: active.threadId })
+          .catch(() => server.rpc.close());
       await hookBridge?.close();
       if (lane.active === active) delete lane.active;
     }
@@ -2917,12 +2776,7 @@ type Item = {
 function follow(
   rpc: AppServer,
   signal: AbortSignal,
-  turn: {
-    threadId?: string;
-    turnId?: string;
-    finished: boolean;
-    completedId?: string;
-  },
+  turn: { threadId?: string; turnId?: string; finished: boolean },
   onItem?: (method: string, item: Item) => void,
 ) {
   let finish!: (status: string) => void;
@@ -2952,7 +2806,6 @@ function follow(
     if (p.item && wire.method) onItem?.(wire.method, p.item);
     if (wire.method === "turn/completed" && p.turn) {
       turn.finished = true;
-      turn.completedId = p.turn.id;
       if (p.turn.status === "failed")
         fail(new Error(p.turn.error?.message ?? "Codex turn failed"));
       else finish(p.turn.status);
@@ -2983,37 +2836,28 @@ const dynamicTools = (added: readonly AddedTool[]) => [
   },
 ];
 const EMPTY: readonly SessionView[] = Object.freeze([]);
-/** A gateway delivery's route revision and turn context, which a steered
- * request must share with its turn. */
+/** A gateway delivery's route revision, channel and thread, which a steered
+ * request must share with its turn. Its message may differ: the turn's
+ * headers keep naming the first. */
 const gatewayMark = (gateway: CodexGateway | undefined) =>
-  gateway && JSON.stringify([gateway.route.revision, gateway.turn]);
-/** How long a gateway turn's end is awaited after it failed or was stopped,
- * before its thread is left uncertain. */
-const COMPLETION_GRACE_MS = 10_000;
-/** Whether a release confirmed the thread let go: `unsubscribed`, or
- * `notLoaded` from a process that already unloaded it. */
-const releasedCleanly = (released: { status?: string } | undefined) =>
-  released?.status === "unsubscribed" || released?.status === "notLoaded";
-/** Whether `turn` is seen to complete on `rpc` within `ms` (`follow` marks
- * it): at once when it already has; false once the connection closes. */
-function completion(
-  rpc: AppServer,
-  turn: { finished: boolean },
-  ms: number,
-): Promise<boolean> {
-  if (turn.finished) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const done = (seen: boolean) => {
-      clearTimeout(timer);
-      off();
-      resolve(seen);
-    };
-    const timer = setTimeout(() => done(turn.finished), ms);
-    const off = rpc.onMessage((wire) => {
-      if (wire.method === "connection/closed") done(false);
-      else if (turn.finished) done(true);
-    });
-  });
+  gateway &&
+  JSON.stringify([
+    gateway.route.revision,
+    gateway.turn.channel_id,
+    gateway.turn.thread_id,
+  ]);
+/** The Buzz session that continues `saved` for `route`: a new one where there
+ * is none, or it can't continue (unreadable, or minted for another owner,
+ * agent or community), so attribution never stops a conversation. */
+function continueSession(
+  route: Readonly<{ identity: GatewayBinding["identity"] }>,
+  saved: unknown,
+): Readonly<{ binding: GatewayBinding; persist: boolean }> {
+  const bound = bindSession(route, saved, "resume");
+  if (bound.ok) return bound;
+  const fresh = bindSession(route, undefined, "new_generation");
+  if (!fresh.ok) throw new Error(fresh.message);
+  return fresh;
 }
 
 /** A started Codex item as a step, named in the shared step vocabulary.

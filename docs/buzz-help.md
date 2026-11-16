@@ -511,14 +511,14 @@ available rather than silently discarding it.
   resends work already sent through the gateway without it. Don't say an agent
   uses the gateway's models unless its Settings shows Model gateway.
 - Once local Codex agents run through the agent gateway, Codex sends each
-  turn's Buzz context with the model provider configured for it on that
-  device, so the gateway can attribute the turn. A new message for a Codex
-  agent that is busy in the conversation waits for that turn to finish and
-  then runs as its own turn rather than joining the running one, so each
-  message keeps its own attribution. When Codex uses its built-in provider, or
+  turn's Buzz context to the gateway when Codex's model provider on that
+  device is the AI Gateway's, so the gateway can attribute the turn. A new
+  message in the same Buzz thread joins a running turn and is attributed to
+  the message that started it. A message from another thread, or after the
+  agent's gateway access changed, waits and runs as its own turn. A running
+  turn is never stopped for attribution. When Codex uses another provider, or
   runs on another machine, its turns run without that context, and Activity
-  shows "Ran without the Buzz context" with the reason. Those messages still
-  wait for the running turn rather than joining it.
+  shows "Ran without the Buzz context" with the reason.
 - **Activity**, where the agent type provides it, shows sessions and their
   transcripts in the agent's profile. Once goose agents run through the agent
   gateway, a goose turn woken in a conversation by a plugin, watch or timer
