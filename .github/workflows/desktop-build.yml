@@ -406,7 +406,7 @@ jobs:
     name: Linux x64 installers
     runs-on: ubuntu-latest
     # Shipped old-Buzz recipe, without its mesh/Kubernetes/updater dependencies.
-    container: ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+    container: ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
     timeout-minutes: 120
     defaults:
       run:
