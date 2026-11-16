@@ -1,8 +1,10 @@
 import { useLayoutEffect, useRef, type RefObject } from "react";
 import type { ChannelMessage } from "../relay/contracts";
+import { compareMessages } from "../relay/message-order";
 import type { RelaySession } from "../relay/session";
 import { useMessageEditScope } from "./MessageEditScope";
 import { useMessageKeyActions } from "./MessageManagement";
+import type { ComposerInputElement } from "./composer-dom";
 import { registerMessageList } from "./message-selection";
 import { lastEditableMessage } from "./useMessageEdit";
 
@@ -20,13 +22,25 @@ export function useMessageSelection(
     const element = list.current;
     if (!element) return;
     if (editScope) editScope.list.current = element;
+    // This scope's own editable draft: a thread without a reply box must not
+    // quote into the channel's, as focusTarget() would fall back to, and a
+    // quote never rewrites a sent message that is being edited.
+    const quoteTarget = () => {
+      const input = editScope?.input.current as ComposerInputElement | null;
+      return input?.isConnected &&
+        !input.disabled &&
+        !input.readOnly &&
+        !input.closest("[data-editing]")
+        ? input
+        : null;
+    };
     const unregister = registerMessageList(element, {
       row: (id) =>
         latest.current.find((row) => row.id === id && !row.membership),
       newest: () =>
         latest.current.reduce<ChannelMessage | undefined>(
           (newest, row) =>
-            !row.membership && (!newest || row.createdAt > newest.createdAt)
+            !row.membership && (!newest || compareMessages(row, newest) > 0)
               ? row
               : newest,
           undefined,
@@ -39,6 +53,8 @@ export function useMessageSelection(
       canMarkUnread: (row) => !!actions?.canMarkUnread(row),
       markUnread: (row) => actions?.markUnread(row),
       composer: () => editScope?.focusTarget() ?? null,
+      canQuote: () => !!quoteTarget(),
+      quote: (html) => !!quoteTarget()?.insertQuote(html),
     });
     return () => {
       unregister();

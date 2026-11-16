@@ -164,12 +164,15 @@ pub fn parse(raw: &str) -> Result<Option<(Native, String)>, Invalid> {
     if raw.len() > MAX_BYTES {
         return Err(Invalid::Size);
     }
-    let value: Value = serde_json::from_str(raw).map_err(|_| Invalid::Json)?;
-    let descriptor = value.as_object().ok_or(Invalid::Keys)?;
+    let mut value: Value = serde_json::from_str(raw).map_err(|_| Invalid::Json)?;
+    let descriptor = value.as_object_mut().ok_or(Invalid::Keys)?;
     // Before the shape, so a version 1 descriptor reads as one.
     if descriptor.get("version").and_then(Value::as_f64) != Some(2.0) {
         return Err(Invalid::Version);
     }
+    descriptor
+        .entry("launcher_client")
+        .or_insert_with(|| Value::String("buzz".into()));
     if !exactly(descriptor, &KEYS) {
         return Err(Invalid::Keys);
     }
