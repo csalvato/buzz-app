@@ -2738,7 +2738,14 @@ export class CodexRuntime {
         },
       };
     };
-    return { params, model, effort, summary, bridged };
+    return {
+      params,
+      model,
+      effort,
+      summary,
+      mode: normalized.config.model_reasoning_summary,
+      bridged,
+    };
   }
   /** What a thread for `request` opens with, and the `print` that tells
    * whether a thread already open is still right: the model and effort are
@@ -2763,15 +2770,16 @@ export class CodexRuntime {
     signal.throwIfAborted();
     const saved = entry.saved[key];
     const existing = resumable(saved, agent.protection);
-    const { params, model, effort, summary, bridged } = await this.prepare(
-      rpc,
-      agent,
-      settings,
-      workspace,
-      request,
-      request.synced,
-      home,
-    );
+    const { params, model, effort, summary, mode, bridged } =
+      await this.prepare(
+        rpc,
+        agent,
+        settings,
+        workspace,
+        request,
+        request.synced,
+        home,
+      );
     if (voiceInstructions) {
       Object.assign(params.config, {
         "realtime.type": "conversational",
@@ -2782,11 +2790,13 @@ export class CodexRuntime {
     const added = this.added();
     const tools = addedKey(added);
     // Codex lists config/read's servers in no fixed order, so keys are sorted.
+    // A thread keeps the summary mode the user chose when it opened.
     const print = JSON.stringify(
       [
         workspace,
         tools,
         agent.protection?.stateKey,
+        mode,
         { ...params, model: undefined },
       ],
       (_, v) =>

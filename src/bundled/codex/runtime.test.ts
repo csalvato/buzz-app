@@ -2309,6 +2309,26 @@ it("asks for reasoning summaries on a turn of a thread left open", async () => {
   expect(f.sent.some((wire) => wire.method === "thread/resume")).toBe(false);
   expect(f.starts()[1]?.params).toMatchObject({ summary: "auto" });
 });
+it("reopens a thread left open when the user changes their summary mode", async () => {
+  const configured: { model_reasoning_summary?: string } = {
+    model_reasoning_summary: "detailed",
+  };
+  const f = fixture([], undefined, false, configured);
+  await f.runtime.run(f.delivery("@Codex first"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  await f.complete(0, "FIRST");
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  configured.model_reasoning_summary = "none";
+  await f.runtime.run(f.delivery("@Codex second"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  expect(
+    f.sent
+      .map((wire) => wire.method)
+      .filter((method) =>
+        ["thread/unsubscribe", "thread/resume"].includes(method ?? ""),
+      ),
+  ).toEqual(["thread/unsubscribe", "thread/resume"]);
+});
 it("keeps a thread open when Codex lists the same servers in another order", async () => {
   const configured: { mcp_servers?: Record<string, Record<string, unknown>> } =
     { mcp_servers: { a: { command: "a" }, b: { command: "b" } } };
@@ -2917,7 +2937,7 @@ it("settles a message Codex steered into a turn whose end arrived with its answe
   const sent = () => f.sent.filter((wire) => wire.method === "turn/start");
   await vi.waitFor(() => expect(sent()).toHaveLength(2));
   f.emit(
-    { id: sent()[1]?.id, result: { turn: { id: "turn-1" } } },
+    { id: sent()[1]?.id ?? 0, result: { turn: { id: "turn-1" } } },
     {
       method: "turn/completed",
       params: { threadId, turn: { id: "turn-1", status: "completed" } },
