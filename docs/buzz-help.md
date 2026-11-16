@@ -620,6 +620,9 @@ and are asked to sign in again in Buzz.
   dots, and do not contribute to the sidebar’s floating **N unread** buttons or
   their avatar previews. Muted activity does not light the macOS Dock unread dot.
   Muting does not mark messages or threads as read.
+- A plugin can replace the macOS Dock unread dot with its own bounded attention
+  count. Buzz still owns badge permission and clears the number when that plugin
+  is disabled; the plugin's description explains what its number counts.
 - **Hidden DMs**: **Close conversation** and **Hide conversation** take a DM out
   of the sidebar without leaving it. To find one again, start a **New message**
   to exactly the same people. Its earlier messages appear before you send,

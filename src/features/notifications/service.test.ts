@@ -259,6 +259,62 @@ it("plugin gates silence alerts until removed or the plugin is disabled", async 
   expect(t.service.gated(target)).toBe(true);
   expect(await t.submit("released")).toBe(true);
 });
+it("lets one plugin own a bounded Dock count and restores the host dot on disable", async () => {
+  const t = setup();
+  const setBadgeCount = vi.spyOn(t.service.indicator, "setBadgeCount");
+  let count = 3;
+  let changed = () => {};
+  t.install({
+    inject: ["notifications"],
+    apply(ctx) {
+      ctx.notifications.dockBadge({
+        id: "direct-messages",
+        count: () => count,
+        subscribe(listener) {
+          changed = listener;
+          return () => {
+            changed = () => {};
+          };
+        },
+      });
+    },
+  });
+  await vi.waitFor(() => expect(setBadgeCount).toHaveBeenLastCalledWith(3));
+  count = 8;
+  changed();
+  expect(setBadgeCount).toHaveBeenLastCalledWith(8);
+  count = Number.NaN;
+  changed();
+  expect(setBadgeCount).toHaveBeenLastCalledWith(undefined);
+  t.disable();
+  await flush();
+  expect(setBadgeCount).toHaveBeenLastCalledWith(undefined);
+});
+it("chooses Dock badge ownership by order and falls back when the winner retires", async () => {
+  const t = setup();
+  const setBadgeCount = vi.spyOn(t.service.indicator, "setBadgeCount");
+  let retirePreferred = () => {};
+  t.install({
+    inject: ["notifications"],
+    apply(ctx) {
+      ctx.notifications.dockBadge({
+        id: "fallback",
+        order: 10,
+        count: () => 9,
+        subscribe: () => () => {},
+      });
+      retirePreferred = ctx.notifications.dockBadge({
+        id: "preferred",
+        order: -1,
+        count: () => 2,
+        subscribe: () => () => {},
+      });
+    },
+  });
+  await vi.waitFor(() => expect(setBadgeCount).toHaveBeenLastCalledWith(2));
+  retirePreferred();
+  expect(setBadgeCount).toHaveBeenLastCalledWith(9);
+});
 it("a gate added while an alert is pending keeps it from showing", async () => {
   const t = setup();
   let gate: Notifications["gate"] | undefined;

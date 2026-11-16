@@ -154,6 +154,7 @@ export type {
   NotificationInput,
   NotificationCategoryDescriptor,
   NotificationGate,
+  NotificationDockBadge,
 } from "../features/notifications/service";
 
 export type { VoiceRecording } from "../features/relay/voice-media";

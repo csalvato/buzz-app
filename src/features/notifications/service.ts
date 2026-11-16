@@ -37,6 +37,14 @@ export type NotificationGate = Readonly<{
   /** A throwing gate is skipped. */
   allows(target: OpenTarget): boolean;
 }>;
+/** Replaces the Dock dot with one bounded attention count while positive. */
+export type NotificationDockBadge = Readonly<{
+  id: string;
+  count(): number;
+  subscribe(listener: () => void): () => void;
+  /** Lower wins when more than one plugin contributes a count. */
+  order?: number;
+}>;
 export interface Notifications {
   register(
     category: NotificationCategoryDescriptor,
@@ -44,6 +52,8 @@ export interface Notifications {
   /** While registered, only targets every gate allows may alert. Returns a
    * remover; disabling the plugin removes it too. */
   gate(gate: NotificationGate): () => void;
+  /** A positive count replaces the Dock dot with 1…99+; zero restores the dot. */
+  dockBadge(badge: NotificationDockBadge): () => void;
 }
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -87,6 +97,7 @@ export class NotificationsService extends Service implements Notifications {
   readonly indicator = createUnreadIndicator();
   private readonly contributions;
   private readonly gates;
+  private readonly dockBadges;
   private readonly listeners = new Set<() => void>();
   private readonly pending = new Set<Candidate>();
   // Outstanding audio decisions for submissions awaiting platform acceptance.
@@ -117,6 +128,7 @@ export class NotificationsService extends Service implements Notifications {
     this.contributions =
       createContributions<NotificationCategoryDescriptor>(ctx);
     this.gates = createContributions<NotificationGate>(ctx);
+    this.dockBadges = createContributions<NotificationDockBadge>(ctx);
     this.state = Object.freeze({
       viewer: undefined,
       ...preferences.snapshot(),
@@ -168,6 +180,45 @@ export class NotificationsService extends Service implements Notifications {
         if (typeof window !== "undefined")
           window.removeEventListener("focus", refresh);
         return this.indicator.dispose();
+      };
+    });
+    ctx.effect(() => {
+      let stopBadge = () => {};
+      const sync = () => {
+        stopBadge();
+        stopBadge = () => {};
+        const badge = [...this.dockBadges.snapshot()].sort(
+          (a, b) =>
+            (a.order ?? 0) - (b.order ?? 0) || a.key.localeCompare(b.key),
+        )[0];
+        if (!badge) {
+          this.indicator.setBadgeCount(undefined);
+          return;
+        }
+        const update = () => {
+          try {
+            const count = badge.count();
+            this.indicator.setBadgeCount(
+              Number.isSafeInteger(count) && count >= 0 ? count : undefined,
+            );
+          } catch {
+            this.indicator.setBadgeCount(undefined);
+          }
+        };
+        try {
+          const stop = badge.subscribe(update);
+          if (typeof stop === "function") stopBadge = stop;
+        } catch {
+          // A broken plugin count never strands the host's ordinary dot.
+        }
+        update();
+      };
+      const stopContributions = this.dockBadges.subscribe(sync);
+      sync();
+      return () => {
+        stopContributions();
+        stopBadge();
+        this.indicator.setBadgeCount(undefined);
       };
     });
     void this.refreshPermission();
@@ -283,6 +334,20 @@ export class NotificationsService extends Service implements Notifications {
     )
       throw new Error("A notification gate needs an id and allows()");
     return this.gates.register(this.ctx, gate);
+  }
+  dockBadge(badge: NotificationDockBadge) {
+    if (
+      !badge ||
+      typeof badge.id !== "string" ||
+      !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(badge.id) ||
+      typeof badge.count !== "function" ||
+      typeof badge.subscribe !== "function" ||
+      (badge.order !== undefined && !Number.isFinite(badge.order))
+    )
+      throw new Error(
+        "A Dock badge needs an id, count(), subscribe(), and finite order",
+      );
+    return this.dockBadges.register(this.ctx, badge);
   }
   revalidate() {
     for (const item of this.pending) {
