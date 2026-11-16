@@ -64,12 +64,8 @@ export const CLAUDES: ReadonlySet<string> = new Set([
 
 /** A spawn whose Claude processes answer like Claude, on an Apple silicon
  * Mac. Sessions named in `known` (or created by a process) can be resumed;
- * others fail to load. Given `failure`, they fail as Claude 2.1.286 and 2.1.318 do:
- * an error result whose `errors` name it, then exit 1. */
-export function fakeSpawn(
-  known = new Set<string>(),
-  failure?: (session: string) => string,
-) {
+ * others fail to load. */
+export function fakeSpawn(known = new Set<string>()) {
   const processes: FakeClaude[] = [];
   const spawn = async (id: string, options: HostProcessOptions = {}) => {
     if (id === "platform") {
@@ -190,18 +186,7 @@ export function fakeSpawn(
       }
       if (message.type !== "user") return;
       if (resume && !known.has(resume)) {
-        if (failure)
-          fake.emit({
-            type: "result",
-            subtype: "error_during_execution",
-            is_error: true,
-            errors: [failure(resume)],
-            session_id: resume,
-          });
-        fake.exit(
-          1,
-          `${failure?.(resume) ?? `No conversation found with session ID: ${resume}`}\n`,
-        );
+        fake.exit(1, `No conversation found with session ID: ${resume}\n`);
         return;
       }
       const content = (message.message as { content: string }).content;

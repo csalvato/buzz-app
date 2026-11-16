@@ -8,12 +8,6 @@
 #   use VERSION                      makes a downloaded release the one in use
 #   review-token                     saves security reviews' sign-in from stdin
 #   review                           prints their folder, then that sign-in
-#   managed FOLDER                   prints each managed settings file
-#                                    Claude reads there, base64, one per line
-#   no-proxy [FOLDER]                prints NO_PROXY and no_proxy, base64,
-#                                    one per line, then whether a proxy is set;
-#                                    with FOLDER, then each settings file
-#                                    Claude reads for it, base64 or empty
 set -eu
 
 # Shared by every Buzz build on this computer, so there is one download.
@@ -171,51 +165,6 @@ review)
   if [ -f "$review/token" ] && [ ! -h "$review/token" ]; then
     cat "$review/token"
   fi
-  ;;
-managed)
-  # Each managed settings file Claude reads in folder $1, which outrank
-  # Buzz's own: the file, then its drop-ins in name order, as later ones
-  # merge over earlier ones. A file it can't read fails the step.
-  managed="${1:?}"
-  # Claude sorts the names by code unit, as the C locale does bytes.
-  export LC_ALL=C
-  for file in "$managed/managed-settings.json" "$managed/managed-settings.d/"*.json; do
-    [ -f "$file" ] || continue
-    encoded=$(base64 <"$file") || exit 1
-    printf '%s\n' "$encoded" | tr -d '\n'
-    echo
-  done
-  ;;
-no-proxy)
-  # The hosts Claude's processes, which inherit this environment, reach
-  # without a proxy: NO_PROXY, then no_proxy, base64, one per line; then
-  # whether they have a proxy, never its value, which may hold a password.
-  for value in "${NO_PROXY-}" "${no_proxy-}"; do
-    printf '%s' "$value" | base64 | tr -d '\n'
-    echo
-  done
-  if [ -n "${HTTPS_PROXY-}${https_proxy-}${HTTP_PROXY-}${http_proxy-}${ALL_PROXY-}${all_proxy-}" ]; then
-    echo proxied
-  else
-    echo direct
-  fi
-  # With an agent's folder $1: its user, project and local settings, in the
-  # order Claude merges them, empty where absent. Their env applies after
-  # launch, over this one. A file it can't read fails the step.
-  [ $# -gt 0 ] || exit 0
-  folder="$1"
-  case "$folder" in
-  "~") folder="$HOME" ;;
-  "~/"*) folder="$HOME/${folder#\~/}" ;;
-  esac
-  for file in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
-    "$folder/.claude/settings.json" "$folder/.claude/settings.local.json"; do
-    if [ -f "$file" ]; then
-      encoded=$(base64 <"$file") || exit 1
-      printf '%s' "$encoded" | tr -d '\n'
-    fi
-    echo
-  done
   ;;
 *)
   echo "Unknown command: $command" >&2

@@ -62,18 +62,22 @@ import {
   systemPrompt,
   turnPrompt,
 } from "./prompt";
-import { AgentSessions, localSessions, Spare, type Forward } from "./sessions";
-import { type ClaudeForwarding, UNAVAILABLE } from "./forwarding";
+import {
+  AgentSessions,
+  type Attribute,
+  localSessions,
+  Spare,
+} from "./sessions";
+import { PROTECTED, refused } from "./attribution";
 import {
   bindSession,
+  inferenceBundle,
   isBuzzUuid,
   isHex64,
+  type SessionEvent,
   type TurnContext,
 } from "../../features/agents/gateway/contract";
-import {
-  type EligibleRoute,
-  fallbackNotice,
-} from "../../features/agents/gateway/route";
+import type { EligibleRoute } from "../../features/agents/gateway/route";
 import { protectionHistoryEntry } from "./security";
 import {
   readSessionTitle,
@@ -179,8 +183,11 @@ const listing = (added: readonly AddedTool[]): Listing => ({
 
 /** How long a session start waits for the agent's recent notes. */
 const NOTES_WAIT_MS = 2_000;
-/** The fallback notices kept for each agent, the oldest dropped first. */
+/** The attribution notices kept for each agent, the oldest dropped first. */
 const NOTICE_LIMIT = 100;
+
+/** A turn's gateway route and frozen context, as `Delivery.gateway` has it. */
+type Gateway = Readonly<{ route: EligibleRoute; turn: TurnContext }>;
 
 export class ClaudeRuntime {
   private readonly agents = new Map<AgentKey, Entry>();
@@ -194,7 +201,7 @@ export class ClaudeRuntime {
   >();
   /** Solo chats whose title was already offered to the host this app run. */
   private readonly titled = new Set<string>();
-  /** Each agent's fallback notices, by the id of the message each ran from. */
+  /** Each agent's turn notices, by the id of the message each ran from. */
   private readonly notices = new Map<AgentKey, Map<string, string>>();
   /** One process started ahead of need, for any agent's next new conversation. */
   private readonly spare = new Spare(
@@ -224,8 +231,11 @@ export class ClaudeRuntime {
       event: string,
       input: unknown,
     ) => Promise<Record<string, unknown>> = async () => ({}),
-    /** Opens forwarded turns' generations; absent without a plugin owner. */
-    private readonly forwarding?: ClaudeForwarding,
+    /** The agent's eligible gateway route for a session control, which has
+     * no delivery; absent while Claude declares no harness. */
+    private readonly gatewayRoute?: (
+      agent: AgentKey,
+    ) => EligibleRoute | undefined,
   ) {}
 
   /** The host's own spawn, not a copy: history read with it is kept for it,
@@ -401,8 +411,8 @@ export class ClaudeRuntime {
         },
     );
   }
-  /** Keeps a turn's fallback notice for its Activity, by the id of the
-   * message it ran from, while the app runs. */
+  /** Keeps a turn's notice for its Activity, by the id of the message it
+   * ran from, while the app runs. */
   private noted(agent: AgentKey, uuid: string, notice: string) {
     const notices = this.notices.get(agent) ?? new Map<string, string>();
     notices.set(uuid, notice);
@@ -499,21 +509,20 @@ export class ClaudeRuntime {
       signal.throwIfAborted();
       if (action === "new") await entry.sessions.forget(key);
       else {
-        // Where the agent's turns go through the gateway, so does Claude's
-        // compaction, under the control's own context; where a turn would
-        // fall back, it fails before anything runs.
-        const route = this.forwarding?.control(agent.key);
-        if (route?.kind === "blocked")
-          throw new Error(compactRefusal(fallbackNotice(route)));
+        // Under the control's own context where the gateway enables Claude;
+        // otherwise it runs on Claude's own headers, never refused.
+        const route = this.gatewayRoute?.(agent.key);
         const result = await entry.sessions.compact(
           key,
-          route &&
-            this.forward(
-              agent.key,
-              { route, turn: controlTurn(place, config(agent.config).scope) },
-              signal,
-            ),
-          () => !signal.aborted,
+          this.attribution(
+            agent.key,
+            route && {
+              route,
+              turn: controlTurn(place, config(agent.config).scope),
+            },
+            "resume",
+            warned,
+          ),
         );
         if (!result.ok) throw new Error(result.error);
       }
@@ -640,11 +649,6 @@ export class ClaudeRuntime {
         const wait = prior && (same ? prior.handed : prior.settled);
         let delivered!: Promise<Settled>;
         let interrupted = false;
-        // The accepted turn's own lifetime, not the handover deadline: a
-        // turn queued behind a running one still opens its generation once
-        // that one ends. Stopping it ends a wait it is still in.
-        const accepted = new AbortController();
-        let sent = false;
         const handed = (async () => {
           await wait;
           if (interrupted) {
@@ -664,6 +668,9 @@ export class ClaudeRuntime {
               : (threadReference(event)?.rootId ?? event.id);
           const notes = agent.notes?.(channel, noteRoot) ?? [];
           const text = this.review(entry, prepared, notes);
+          // A mention's request shows the host's fallback notice; a wake's
+          // shows in Activity, as does any attribution notice.
+          let notice = wake ? gatewayFallback?.notice : undefined;
           // A conversation's tools default to its thread; a session shared by
           // several threads is told which to reply in instead.
           entry.contexts.set(
@@ -703,18 +710,17 @@ export class ClaudeRuntime {
               ...(effort ? { effort } : {}),
             },
             admit,
-            signal: accepted.signal,
-            sending: () => {
-              sent = true;
+            attribute: this.attribution(
+              agent.key,
+              gateway,
+              "resume",
+              (text) => {
+                notice = text;
+              },
+            ),
+            submitted: (uuid: string) => {
+              if (notice) this.noted(agent.key, uuid, notice);
             },
-            ...forwarded(this.forward(agent.key, gateway, accepted.signal)),
-            // A mention's request shows its own; a wake's shows in Activity.
-            ...(wake && gatewayFallback
-              ? {
-                  submitted: (uuid: string) =>
-                    this.noted(agent.key, uuid, gatewayFallback.notice),
-                }
-              : {}),
           });
           void delivered.then(
             (result) => {
@@ -748,12 +754,9 @@ export class ClaudeRuntime {
         if (!wait) await handed;
         // The turn outlives `run`, which the host is told so it shows it as working.
         workingUntil(done);
-        // A turn still waiting stops alone; the process's turn is stopped
-        // only once this one was sent into it.
-        interruptible?.(async () => {
+        interruptible?.(() => {
           interrupted = true;
-          accepted.abort(new Error("Stopped"));
-          if (sent) await entry.sessions.interrupt(key);
+          return entry.sessions.interrupt(key);
         });
         this.notify();
         this.watch(done, async (error) => {
@@ -824,54 +827,71 @@ export class ClaudeRuntime {
     entry.team = team ?? "";
     const refused = await this.refusal(agent.key, delivery.synced?.effort);
     if (refused) return { ok: false, error: refused };
-    const forward = this.forward(agent.key, delivery.gateway, signal, true);
-    const done = entry.sessions.runOnce(key, prompt, signal, forward);
+    const done = entry.sessions.runOnce(
+      key,
+      prompt,
+      signal,
+      this.attribution(agent.key, delivery.gateway, "standalone", warned),
+    );
     this.notify();
     return done.finally(() => this.notify());
   }
 
-  /** How a turn whose membership routes through the gateway opens its
-   * generation, for harness session `session`, at the route it was
-   * dispatched with. A turn that can't be forwarded fails visibly before
-   * anything spawns; it never runs on Claude's own configuration instead,
-   * and is never retried or replayed. */
-  private forward(
+  /** How a new turn sets its gateway attribution: the shared contract's
+   * bundle for `gateway` over the process's own custom headers, or, without
+   * one, the process's own headers back. Its binding is the saved one for
+   * `resume` and a fresh unsaved one for `standalone`. Anything that keeps
+   * it unattributed is `noted`; the turn always runs. */
+  private attribution(
     agent: AgentKey,
-    gateway: Readonly<{ route: EligibleRoute; turn: TurnContext }> | undefined,
-    signal: AbortSignal,
-    standalone = false,
-  ): Forward | undefined {
-    if (!gateway) return undefined;
-    const open = async (session: string, saved: unknown) => {
-      // A protected agent forwards on its own protected launch: the gate,
-      // pinned release, containment and hooks are the same, and forwarding
-      // adds only the generation's URL and session (`sessions.ts` `start`).
-      if (!this.forwarding) throw new Error(UNAVAILABLE);
-      const bound = bindSession(
-        gateway.route,
-        saved,
-        standalone ? "standalone" : "resume",
-      );
-      if (!bound.ok) throw new Error(bound.message);
-      // A protected launch reads no settings files, so only an unprotected
-      // one's folder is read for the proxy exceptions they set.
-      const entry = this.agents.get(agent);
-      const folder =
-        entry && !entry.protected ? entry.config.workspace : undefined;
-      const generation = await this.forwarding.open(
-        agent,
-        gateway.route,
-        {
-          binding: bound.binding,
-          context: gateway.turn,
-          session,
-          ...(folder === undefined ? {} : { folder }),
-        },
-        signal,
-      );
-      return { generation, binding: bound.binding };
+    gateway: Gateway | undefined,
+    event: Extract<SessionEvent, "resume" | "standalone">,
+    noted: (notice: string) => void,
+  ): Attribute {
+    return async (process, saved) => {
+      // Its pinned launch reads none of the person's settings, so no gateway.
+      if (gateway && this.agents.get(agent)?.protected) {
+        noted(PROTECTED);
+        return undefined;
+      }
+      const restore = async (notice?: string) => {
+        const failed = await process.attribute(undefined);
+        const shown = notice ?? failed;
+        if (shown) noted(shown);
+      };
+      if (!gateway) {
+        await restore();
+        return undefined;
+      }
+      const { route, turn } = gateway;
+      let bound: ReturnType<typeof bindSession>;
+      try {
+        bound = bindSession(route, saved, event);
+      } catch (error) {
+        await restore(
+          refused(error instanceof Error ? error.message : String(error)),
+        );
+        return undefined;
+      }
+      // A saved binding for someone else is never replaced here: only New
+      // session starts another.
+      if (!bound.ok) {
+        await restore(refused(bound.message));
+        return undefined;
+      }
+      const bundle = inferenceBundle(route.profile, bound.binding, turn);
+      if (!bundle.ok) {
+        await restore(refused(bundle.message));
+        return bound.binding;
+      }
+      const notice = await process.attribute({
+        origin: route.gatewayOrigin,
+        profile: route.profile,
+        headers: bundle.value,
+      });
+      if (notice) noted(notice);
+      return bound.binding;
     };
-    return Object.assign(open, { revision: gateway.route.revision });
   }
 
   /** Why a new process can't run a synced effort, which is the agent's on
@@ -1239,12 +1259,6 @@ export function modelName(model: string) {
   return id ? `${name} ${id[2]}${id[3] ? `.${id[3]}` : ""}` : name;
 }
 
-/** A control's error for a fallback notice: it never runs unforwarded. */
-const compactRefusal = (notice: string) =>
-  notice.replace(
-    /^Ran without the agent gateway: /,
-    "Couldn't compact through the agent gateway: ",
-  );
 /** A session control's own context: its channel, and its thread only for a
  * thread's session; it carries no message. */
 const controlTurn = (place: SessionPlace, scope: string): TurnContext =>
@@ -1253,5 +1267,6 @@ const controlTurn = (place: SessionPlace, scope: string): TurnContext =>
     message_id: null,
     thread_id: scope !== "channel" && isHex64(place.root) ? place.root : null,
   });
-const forwarded = (forward: Forward | undefined) =>
-  forward ? { forward } : {};
+/** A notice with no turn in Activity to show on: a compaction's or a
+ * standalone turn's. It names no setting's value. */
+const warned = (notice: string) => console.warn(notice);
