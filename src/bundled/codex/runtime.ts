@@ -3123,8 +3123,9 @@ export class CodexRuntime {
             }
             throw error;
           });
-        // Codex steered the message into the turn that was running.
-        if (base && !base.finished && turn.turn.id === base.turnId) {
+        // Codex steered the message into the turn that was running, which
+        // may have ended before its answer was read.
+        if (base && turn.turn.id === base.turnId) {
           base.reply = request;
           base.requests.push(request);
           entry.waiting.delete(request);
@@ -3134,6 +3135,7 @@ export class CodexRuntime {
           active.requests = [];
           ready();
           placed();
+          if (base.finished) void base.released.then(() => request.answered());
           return;
         }
         active.turnId = turn.turn.id;

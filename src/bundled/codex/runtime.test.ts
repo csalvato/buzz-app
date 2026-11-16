@@ -321,15 +321,20 @@ function fixture(
     options = value;
     return process;
   });
-  const emit = (value: Wire) => {
-    const p = value.params as
-      | { threadId?: string; turn?: { id: string } }
-      | undefined;
-    if (p?.threadId && value.method === "turn/started" && p.turn)
-      live.set(p.threadId, p.turn.id);
-    if (p?.threadId && value.method === "turn/completed")
-      live.delete(p.threadId);
-    options?.onStdout?.(`${JSON.stringify(value)}\n`);
+  /** Writes `values` to stdout in one chunk, as Codex may. */
+  const emit = (...values: Wire[]) => {
+    for (const value of values) {
+      const p = value.params as
+        | { threadId?: string; turn?: { id: string } }
+        | undefined;
+      if (p?.threadId && value.method === "turn/started" && p.turn)
+        live.set(p.threadId, p.turn.id);
+      if (p?.threadId && value.method === "turn/completed")
+        live.delete(p.threadId);
+    }
+    options?.onStdout?.(
+      values.map((value) => `${JSON.stringify(value)}\n`).join(""),
+    );
   };
   const publish = vi.fn(async (event: unknown) => ({
     ...(event as object),
@@ -2832,6 +2837,34 @@ it("starts the turn of the first message sent after a turn ended and steers the 
   f.complete(1, "SECOND");
   await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(2));
   expect(f.starts()).toHaveLength(2);
+});
+
+it("settles a message Codex steered into a turn whose end arrived with its answer", async () => {
+  const f = fixture();
+  await f.runtime.run(f.delivery("first"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  const threadId = String(
+    (f.starts()[0]?.params as { threadId?: string } | undefined)?.threadId,
+  );
+  f.held.set("turn/start", new Promise(() => undefined));
+  await f.runtime.run(f.delivery("steered"));
+  const sent = () => f.sent.filter((wire) => wire.method === "turn/start");
+  await vi.waitFor(() => expect(sent()).toHaveLength(2));
+  f.emit(
+    { id: sent()[1]?.id, result: { turn: { id: "turn-1" } } },
+    {
+      method: "turn/completed",
+      params: { threadId, turn: { id: "turn-1", status: "completed" } },
+    },
+  );
+  await expect(f.workingUntil.mock.calls[1]?.[0]).resolves.toEqual({
+    ok: true,
+  });
+  // Nothing is left holding the conversation.
+  f.held.delete("turn/start");
+  await f.runtime.run(f.delivery("next"));
+  await vi.waitFor(() => expect(sent()).toHaveLength(3));
+  expect(inputText(sent()[2])).toContain("next");
 });
 
 it("tries each message behind one whose turn failed to start as a turn of its own", async () => {
