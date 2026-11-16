@@ -204,7 +204,6 @@ struct Opening {
     events: mpsc::UnboundedReceiver<serde_json::Value>,
 }
 fn open(forward: &HostForward, harness: Harness, revision: u64) -> Opening {
-    let session = (harness == Harness::Claude).then(|| SESSION.to_owned());
     let (channel, events) = channel();
     match forward
         .open(
@@ -213,7 +212,7 @@ fn open(forward: &HostForward, harness: Harness, revision: u64) -> Opening {
             "route-a",
             revision,
             harness,
-            session,
+            None,
             &inference(),
             &discovery(),
             channel,
@@ -223,6 +222,14 @@ fn open(forward: &HostForward, harness: Harness, revision: u64) -> Opening {
         Opened::Opened { id, url } => Opening { id, url, events },
         refused => panic!("not opened: {refused:?}"),
     }
+}
+/// A goose generation ready for inference after explicit session association.
+fn associated(forward: &HostForward, revision: u64) -> Opening {
+    let generation = open(forward, Harness::Goose, revision);
+    forward
+        .associate(PLUGIN, generation.id, SESSION.into())
+        .unwrap();
+    generation
 }
 /// A neutral gateway configuration on `origin`, as the descriptor's native
 /// subset would hold it.
@@ -258,8 +265,8 @@ fn ready(origin: &str) -> HostForward {
 
 fn messages(url: &str) -> reqwest::RequestBuilder {
     reqwest::Client::new()
-        .post(format!("{url}/v1/messages?beta=true"))
-        .header("x-claude-code-session-id", SESSION)
+        .post(format!("{url}/serving-endpoints/model-a/invocations"))
+        .header("agent-session-id", SESSION)
         .header("x-api-key", "placeholder")
         .header("content-type", "application/json")
 }
@@ -498,8 +505,8 @@ async fn admission_matches_the_reference_reducer() {
                             PLUGIN,
                             "route-a",
                             revision,
-                            Harness::Claude,
-                            Some(SESSION.into()),
+                            Harness::Goose,
+                            None,
                             &inference(),
                             &discovery(),
                             channel,
@@ -507,6 +514,7 @@ async fn admission_matches_the_reference_reducer() {
                         .unwrap();
                     match (result, refused) {
                         (Opened::Opened { id, url }, None) => {
+                            forward.associate(PLUGIN, id, SESSION.into()).unwrap();
                             opened.insert(label, Opening { id, url, events });
                         }
                         (Opened::Refused { current, admits }, Some(expected)) => {
@@ -536,8 +544,8 @@ async fn admission_matches_the_reference_reducer() {
     }
     // A handle opens once: every open mints a new one.
     let forward = ready(gateway.origin);
-    let first = open(&forward, Harness::Claude, 1);
-    let second = open(&forward, Harness::Claude, 1);
+    let first = associated(&forward, 1);
+    let second = associated(&forward, 1);
     assert_ne!(handle(&first.url), handle(&second.url));
     assert_eq!(
         URL_SAFE_NO_PAD.decode(handle(&first.url)).unwrap().len(),
@@ -549,7 +557,7 @@ async fn admission_matches_the_reference_reducer() {
 async fn forwards_inference_with_only_the_bundle_as_provenance() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut generation = open(&forward, Harness::Claude, 1);
+    let mut generation = associated(&forward, 1);
     let response = messages(&generation.url)
         .header("x-gw-ctx-channel-id", "forged")
         .header("X-GW-Launcher-Client", "forged")
@@ -564,7 +572,10 @@ async fn forwards_inference_with_only_the_bundle_as_provenance() {
     assert_eq!(response.text().await.unwrap(), r#"{"stream":true}"#);
     let seen = recv(&mut gateway.seen).await;
     assert_eq!(seen.method, "POST");
-    assert_eq!(seen.path, "/upstream/claude/v1/messages?beta=true");
+    assert_eq!(
+        seen.path,
+        "/upstream/goose/serving-endpoints/model-a/invocations"
+    );
     assert_eq!(seen.body, Bytes::from_static(br#"{"stream":true}"#));
     let header = |name: &str| seen.headers.get(name).map(|value| value.to_str().unwrap());
     assert_eq!(header("x-gw-launcher-client"), Some("client-a"));
@@ -574,7 +585,7 @@ async fn forwards_inference_with_only_the_bundle_as_provenance() {
     }
     assert_eq!(header("x-gw-request-id"), Some("keep"));
     assert_eq!(header("x-api-key"), Some("placeholder"));
-    assert_eq!(header("x-claude-code-session-id"), Some(SESSION));
+    assert_eq!(header("agent-session-id"), Some(SESSION));
     assert_eq!(
         header("host"),
         Some(gateway.origin.trim_start_matches("http://"))
@@ -590,13 +601,13 @@ async fn forwards_inference_with_only_the_bundle_as_provenance() {
 
     // Discovery carries the discovery bundle, with or without the session.
     let hello = reqwest::Client::new()
-        .head(format!("{}/api/hello", generation.url))
+        .get(format!("{}/api/2.0/serving-endpoints", generation.url))
         .send()
         .await
         .unwrap();
     assert_eq!(hello.status(), StatusCode::OK);
     let seen = recv(&mut gateway.seen).await;
-    assert_eq!(seen.path, "/upstream/claude/api/hello");
+    assert_eq!(seen.path, "/upstream/goose/api/2.0/serving-endpoints");
     assert_eq!(recv(&mut generation.events).await["type"], "admitted");
     assert_eq!(
         recv(&mut generation.events).await,
@@ -617,7 +628,7 @@ async fn the_final_url_keeps_the_configured_origin_and_base() {
     let mut gateway = fake_gateway().await;
     let with_base = |base: &str| {
         let mut config = config(gateway.origin).unwrap();
-        config.upstreams.insert("claude-code".into(), base.into());
+        config.upstreams.insert("goose".into(), base.into());
         let forward = HostForward::new(Some(config));
         forward
             .push(forward.page(), PLUGIN, "route-a", 1, true)
@@ -625,12 +636,12 @@ async fn the_final_url_keeps_the_configured_origin_and_base() {
         forward
     };
     let forward = with_base("/a/b-c/d.e");
-    let generation = open(&forward, Harness::Claude, 1);
+    let generation = associated(&forward, 1);
     let response = messages(&generation.url).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         recv(&mut gateway.seen).await.path,
-        "/a/b-c/d.e/v1/messages?beta=true"
+        "/a/b-c/d.e/serving-endpoints/model-a/invocations"
     );
     // The descriptor refuses these; were one to reach the transport anyway,
     // the target's parse must neither move the origin nor rewrite the base.
@@ -644,7 +655,7 @@ async fn the_final_url_keeps_the_configured_origin_and_base() {
         "/a#x",
     ] {
         let forward = with_base(base);
-        let generation = open(&forward, Harness::Claude, 1);
+        let generation = associated(&forward, 1);
         let response = messages(&generation.url).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{base}");
         assert!(
@@ -668,7 +679,7 @@ async fn the_final_url_keeps_the_configured_origin_and_base() {
 async fn passes_upstream_status_and_refuses_redirects() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut generation = open(&forward, Harness::Claude, 1);
+    let mut generation = associated(&forward, 1);
     let busy = messages(&generation.url)
         .header("x-test", "busy")
         .body("{}")
@@ -703,9 +714,8 @@ async fn passes_upstream_status_and_refuses_redirects() {
 async fn only_allowlisted_paths_reach_the_gateway() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let claude = open(&forward, Harness::Claude, 1);
-    let goose = open(&forward, Harness::Goose, 1);
-    let host = claude
+    let goose = associated(&forward, 1);
+    let host = goose
         .url
         .trim_start_matches("http://")
         .split('/')
@@ -713,26 +723,43 @@ async fn only_allowlisted_paths_reach_the_gateway() {
         .unwrap();
     let request = |method: &str, target: &str, extra: &str| {
         format!(
-            "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}x-claude-code-session-id: {SESSION}\r\ncontent-length: 0\r\n\r\n"
+            "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}agent-session-id: {SESSION}\r\ncontent-length: 0\r\n\r\n"
         )
     };
-    let c = handle(&claude.url);
     let g = handle(&goose.url);
     for (method, target, extra) in [
-        ("POST", format!("/{c}/v1/messages/"), ""),
-        ("POST", format!("/{c}/v1//messages"), ""),
-        ("POST", format!("/{c}/v1/./messages"), ""),
-        ("POST", format!("/{c}/v1/x/../messages"), ""),
-        ("POST", format!("/{c}/v1/%6Dessages"), ""),
-        ("POST", format!("/{c}/v1/messages?beta=true&x=1"), ""),
-        ("POST", format!("/{c}/v1/messages/count_tokens"), ""),
-        ("GET", format!("/{c}/v1/messages"), ""),
-        ("GET", format!("/{c}/other/probe"), ""),
-        ("GET", format!("/{c}/https://elsewhere.example/"), ""),
+        ("POST", format!("/{g}/serving-endpoints/m/invocations/"), ""),
+        ("POST", format!("/{g}/serving-endpoints//m/invocations"), ""),
+        (
+            "POST",
+            format!("/{g}/serving-endpoints/./m/invocations"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/{g}/serving-endpoints/x/../m/invocations"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/{g}/serving-endpoints/%6D/invocations"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/{g}/serving-endpoints/m/invocations?beta=true"),
+            "",
+        ),
+        ("GET", format!("/{g}/serving-endpoints/m/invocations"), ""),
+        ("GET", format!("/{g}/other/probe"), ""),
+        ("GET", format!("/{g}/https://elsewhere.example/"), ""),
         ("GET", "http://elsewhere.example/".to_owned(), ""),
-        ("GET", format!("http://elsewhere.example/{c}/api/hello"), ""),
         // Absolute form is refused even naming this listener and an allowed route.
-        ("HEAD", format!("http://{host}/{c}/api/hello"), ""),
+        (
+            "GET",
+            format!("http://{host}/{g}/api/2.0/serving-endpoints"),
+            "",
+        ),
         ("GET", format!("/{g}/api/2.0/serving-endpoints/..%2Fx"), ""),
         ("GET", format!("/{g}/api/2.0/serving-endpoints/.hidden"), ""),
         (
@@ -740,21 +767,28 @@ async fn only_allowlisted_paths_reach_the_gateway() {
             format!("/{g}/serving-endpoints/m/invocations/x"),
             "",
         ),
-        ("POST", format!("/{c}/serving-endpoints/m/invocations"), ""),
+        // Claude routes no longer belong to the native transport.
+        ("HEAD", format!("/{g}/api/hello"), ""),
+        ("POST", format!("/{g}/v1/messages"), ""),
+        ("POST", format!("/{g}/v1/messages?beta=true"), ""),
         (
             "POST",
-            format!("/{c}/v1/messages"),
+            format!("/{g}/serving-endpoints/m/invocations"),
             "Origin: https://page.example\r\n",
         ),
-        ("POST", "/unknown/v1/messages".to_owned(), ""),
+        (
+            "POST",
+            "/unknown/serving-endpoints/m/invocations".to_owned(),
+            "",
+        ),
     ] {
-        let status = raw(&claude.url, &request(method, &target, extra)).await;
+        let status = raw(&goose.url, &request(method, &target, extra)).await;
         assert!(status.contains(" 404 "), "{method} {target}: {status}");
     }
     let wrong_host = format!(
-        "POST /{c}/v1/messages HTTP/1.1\r\nHost: localhost\r\nx-claude-code-session-id: {SESSION}\r\ncontent-length: 0\r\n\r\n"
+        "POST /{g}/serving-endpoints/m/invocations HTTP/1.1\r\nHost: localhost\r\nagent-session-id: {SESSION}\r\ncontent-length: 0\r\n\r\n"
     );
-    assert!(raw(&claude.url, &wrong_host).await.contains(" 404 "));
+    assert!(raw(&goose.url, &wrong_host).await.contains(" 404 "));
     assert!(
         tokio::time::timeout(Duration::from_millis(200), gateway.seen.recv())
             .await
@@ -767,31 +801,34 @@ async fn only_allowlisted_paths_reach_the_gateway() {
 async fn inference_must_name_the_generation_session() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut claude = open(&forward, Harness::Claude, 1);
+    let mut associated_goose = associated(&forward, 1);
     let client = reqwest::Client::new();
     let post = || {
         client
-            .post(format!("{}/v1/messages", claude.url))
+            .post(format!(
+                "{}/serving-endpoints/model-a/invocations",
+                associated_goose.url
+            ))
             .body("{}")
     };
     assert_eq!(
         post().send().await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
-    let other = post().header("x-claude-code-session-id", "other");
+    let other = post().header("agent-session-id", "other");
     assert_eq!(
         other.send().await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
     let twice = post()
-        .header("x-claude-code-session-id", SESSION)
-        .header("x-claude-code-session-id", SESSION);
+        .header("agent-session-id", SESSION)
+        .header("agent-session-id", SESSION);
     assert_eq!(
         twice.send().await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        recv(&mut claude.events).await,
+        recv(&mut associated_goose.events).await,
         serde_json::json!({ "type": "refused", "status": 400, "reason": "session_mismatch" })
     );
 
@@ -839,7 +876,7 @@ async fn inference_must_name_the_generation_session() {
         .associate(PLUGIN, goose.id, "20261104_1".into())
         .is_err());
     assert!(forward
-        .associate(PLUGIN, claude.id, "20261104_1".into())
+        .associate(PLUGIN, associated_goose.id, "20261104_1".into())
         .is_err());
     assert_eq!(
         invoke("20261104_2").send().await.unwrap().status(),
@@ -868,7 +905,7 @@ async fn inference_must_name_the_generation_session() {
 async fn seal_is_terminal_while_admitted_streams_finish() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut generation = open(&forward, Harness::Claude, 1);
+    let mut generation = associated(&forward, 1);
     let mut stream = messages(&generation.url)
         .header("x-test", "hold")
         .body("{}")
@@ -938,7 +975,7 @@ async fn seal_is_terminal_while_admitted_streams_finish() {
 async fn revocation_aborts_admitted_streams() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut generation = open(&forward, Harness::Claude, 1);
+    let mut generation = associated(&forward, 1);
     let mut stream = messages(&generation.url)
         .header("x-test", "hold")
         .body("{}")
@@ -975,8 +1012,8 @@ async fn revocation_aborts_admitted_streams() {
             PLUGIN,
             "route-b",
             1,
-            Harness::Claude,
-            Some(SESSION.into()),
+            Harness::Goose,
+            None,
             &inference(),
             &discovery(),
             channel().0,
@@ -995,7 +1032,7 @@ async fn revocation_aborts_admitted_streams() {
 async fn a_harness_that_hangs_up_aborts_upstream() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut generation = open(&forward, Harness::Claude, 1);
+    let mut generation = associated(&forward, 1);
     let mut stream = messages(&generation.url)
         .header("x-test", "hold")
         .body("{}")
@@ -1016,7 +1053,7 @@ async fn a_harness_that_hangs_up_aborts_upstream() {
 async fn revocation_drops_upstream_while_the_harness_stops_reading() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut generation = open(&forward, Harness::Claude, 1);
+    let mut generation = associated(&forward, 1);
     let host = generation
         .url
         .trim_start_matches("http://")
@@ -1025,7 +1062,7 @@ async fn revocation_drops_upstream_while_the_harness_stops_reading() {
         .unwrap();
     let mut socket = TcpStream::connect(host).await.unwrap();
     let head = format!(
-        "POST /{}/v1/messages HTTP/1.1\r\nHost: {host}\r\nx-claude-code-session-id: {SESSION}\r\nx-test: flood\r\ncontent-length: 0\r\n\r\n",
+        "POST /{}/serving-endpoints/model-a/invocations HTTP/1.1\r\nHost: {host}\r\nagent-session-id: {SESSION}\r\nx-test: flood\r\ncontent-length: 0\r\n\r\n",
         handle(&generation.url)
     );
     socket.write_all(head.as_bytes()).await.unwrap();
@@ -1167,7 +1204,7 @@ async fn relay_reports_a_complete_response_complete_however_the_harness_lets_go(
 async fn strips_headers_the_connection_nominates() {
     let mut gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let generation = open(&forward, Harness::Claude, 1);
+    let generation = associated(&forward, 1);
     let host = generation
         .url
         .trim_start_matches("http://")
@@ -1175,7 +1212,7 @@ async fn strips_headers_the_connection_nominates() {
         .next()
         .unwrap();
     let head = format!(
-        "POST /{}/v1/messages HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive, X-Hop-A\r\nconnection: x-HOP-b , x-gw-ctx-message-id\r\nx-hop-a: 1\r\nX-Hop-B: 1\r\nx-kept: 1\r\nx-claude-code-session-id: {SESSION}\r\ncontent-length: 0\r\n\r\n",
+        "POST /{}/serving-endpoints/model-a/invocations HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive, X-Hop-A\r\nconnection: x-HOP-b , x-gw-ctx-message-id\r\nx-hop-a: 1\r\nX-Hop-B: 1\r\nx-kept: 1\r\nagent-session-id: {SESSION}\r\ncontent-length: 0\r\n\r\n",
         handle(&generation.url)
     );
     assert!(raw(&generation.url, &head).await.contains(" 200 "));
@@ -1211,7 +1248,7 @@ async fn strips_headers_the_connection_nominates() {
 async fn generations_belong_to_their_plugin_and_page() {
     let gateway = fake_gateway().await;
     let forward = ready(gateway.origin);
-    let mut generation = open(&forward, Harness::Claude, 1);
+    let mut generation = associated(&forward, 1);
     // Another plugin's routes are its own: its push revokes nothing here.
     assert_eq!(
         forward
@@ -1244,8 +1281,8 @@ async fn generations_belong_to_their_plugin_and_page() {
         PLUGIN,
         "route-a",
         1,
-        Harness::Claude,
-        Some(SESSION.into()),
+        Harness::Goose,
+        None,
         &inference(),
         &discovery(),
         channel().0,
@@ -1271,7 +1308,7 @@ async fn refuses_to_open_without_a_gateway_or_valid_inputs() {
         )
     };
     assert_eq!(
-        opened(&off, Harness::Claude, Some(SESSION), inference()),
+        opened(&off, Harness::Goose, None, inference()),
         Err("Gateway forwarding is off".into())
     );
     // A gateway without this harness's upstream, or on an insecure origin.
@@ -1286,7 +1323,7 @@ async fn refuses_to_open_without_a_gateway_or_valid_inputs() {
             .push(forward.page(), PLUGIN, "route-a", 1, true)
             .unwrap();
         assert_eq!(
-            opened(&forward, Harness::Claude, Some(SESSION), inference()),
+            opened(&forward, Harness::Goose, None, inference()),
             Err("Gateway forwarding is off".into())
         );
     }
@@ -1301,7 +1338,6 @@ async fn refuses_to_open_without_a_gateway_or_valid_inputs() {
         opened(&forward, Harness::Goose, None, inference()),
         Err("Gateway forwarding is off".into())
     );
-    assert!(opened(&forward, Harness::Claude, Some(SESSION), inference()).is_ok());
     for origin in [
         "https://gateway.example/",
         "http://gateway.example",
@@ -1311,13 +1347,11 @@ async fn refuses_to_open_without_a_gateway_or_valid_inputs() {
     }
     assert!(super::origin("https://gateway.example").is_some());
     let forward = ready(fake_gateway().await.origin);
-    assert!(opened(&forward, Harness::Claude, None, inference()).is_err());
-    assert!(opened(&forward, Harness::Claude, Some("a b"), inference()).is_err());
     assert!(opened(&forward, Harness::Goose, Some("20261104_1"), inference()).is_err());
     assert!(opened(
         &forward,
-        Harness::Claude,
-        Some(SESSION),
+        Harness::Goose,
+        None,
         headers(&[("authorization", "x")])
     )
     .is_err());
@@ -1382,10 +1416,7 @@ fn ipc_shapes_match_the_typescript_bindings() {
     ] {
         assert_eq!(json(serde_json::to_value(event)), expected);
     }
-    assert_eq!(
-        serde_json::from_value::<Harness>(serde_json::json!("claude")).unwrap(),
-        Harness::Claude
-    );
+    assert!(serde_json::from_value::<Harness>(serde_json::json!("claude")).is_err());
     assert_eq!(
         serde_json::from_value::<Harness>(serde_json::json!("goose")).unwrap(),
         Harness::Goose
