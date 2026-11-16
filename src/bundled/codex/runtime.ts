@@ -1477,7 +1477,6 @@ export class CodexRuntime {
       ),
     );
   }
-  /** Dates the binding now, when it takes in a message or ends a turn. */
   /** Lets go of conversation `key`'s open thread: Codex unloads it once no
    * client is subscribed, and its hook bridge closes. */
   private async drop(entry: Entry, key: string) {
@@ -1518,6 +1517,7 @@ export class CodexRuntime {
     }, IDLE_MS);
     if (!busy(lane)) for (const listener of this.listeners) listener();
   }
+  /** Dates the binding now, when it takes in a message or ends a turn. */
   private touch(request: Request, entry: Entry, key: string) {
     const saved = entry.saved[key];
     if (!saved) return;
