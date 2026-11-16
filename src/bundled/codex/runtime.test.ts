@@ -2576,7 +2576,8 @@ it("settles a message steered into a stopped turn as stopped when its answer com
   const sent = () => f.sent.filter((wire) => wire.method === "turn/start");
   await vi.waitFor(() => expect(sent()).toHaveLength(2));
   f.held.set("turn/interrupt", new Promise(() => undefined));
-  void interruptible.mock.calls[0]?.[0]?.();
+  // The interrupt is never answered, so the stop ends with the connection.
+  void interruptible.mock.calls[0]?.[0]?.()?.catch(() => undefined);
   await vi.waitFor(() =>
     expect(f.sent.some((wire) => wire.method === "turn/interrupt")).toBe(true),
   );
