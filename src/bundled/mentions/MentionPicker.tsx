@@ -21,7 +21,14 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useTeamMentions } from "./use-team-mentions";
 import { useMentionChoices } from "./use-mention-choices";
 import type { ComposerSession } from "../../features/messages/composer-session";
-import { outsideMentionDetail } from "./mention-candidates";
+import {
+  outsideMentionDetail,
+  remoteMentionDetail,
+} from "./mention-candidates";
+import {
+  allowsOutsideMentions,
+  outsideMentionReferences,
+} from "../../features/messages/mention-admission";
 import { matchPerson } from "../../features/search/person-match";
 import { MatchedLabel } from "../../features/search/MatchedLabel";
 import { useSearchHighlight } from "../../features/search/use-search-highlight";
@@ -64,6 +71,7 @@ export function MentionPicker({
   const searchInput = useRef<HTMLElement>(null);
   // The picker stays mounted while closed; each opening is its own lifetime.
   const [opening, setOpening] = useState(0);
+  const [addressed, setAddressed] = useState<ReadonlySet<string>>();
   const lifetime = `picker:${useId()}:${opening}`;
   const model = useMentionChoices(
     session,
@@ -72,6 +80,8 @@ export function MentionPicker({
     search,
     lifetime,
     open && !disabled,
+    addressed,
+    !audience,
   );
   const {
     profiles,
@@ -141,7 +151,7 @@ export function MentionPicker({
   };
   const personKey = (pubkey: string) => `person:${pubkey}`;
   const teamKey = (id: string) => `team:${id}`;
-  // Order stays rankMentions', shared with inline @ completion and mobile.
+  // Highlight follows the installed order, including addressed-first rows.
   // The highlight skips rows that cannot be chosen, as the arrow keys did.
   const highlight = useSearchHighlight({
     query: search,
@@ -191,6 +201,11 @@ export function MentionPicker({
             : "inside";
         if (next) {
           setOpening((value) => value + 1);
+          setAddressed(
+            audience
+              ? new Set(audience.recipients.map((person) => person.pubkey))
+              : undefined,
+          );
           accepted.current = false;
           if (!draftRoster) session.channels.ensureList();
         }
@@ -293,11 +308,12 @@ export function MentionPicker({
               variant="capsule"
               inputRef={searchInput}
               label={
-                draftRoster
-                  ? "Search recipients"
-                  : inviteAgents
-                    ? "Search members and agents"
-                    : "Search community people and agents"
+                !audience &&
+                allowsOutsideMentions(channel, draftRoster, inviteAgents)
+                  ? "Search community people and agents"
+                  : draftRoster
+                    ? "Search recipients"
+                    : "Search members and agents"
               }
               value={search}
               onValueChange={setSearch}
@@ -389,9 +405,11 @@ export function MentionPicker({
                   agent,
                   elsewhere,
                   disabled: reason,
-                  fullName,
+                  otherName,
+                  execution,
                 }) => {
                   const managedBy = model.managedBy.get(recipient.pubkey);
+                  const remoteDetail = remoteMentionDetail(execution);
                   // Each addressed agent's row shows a check; fill is only
                   // the keyboard and pointer highlight.
                   const addressed = !!audience?.recipients.some(
@@ -433,17 +451,24 @@ export function MentionPicker({
                             {agent && <span className="sr-only"> Agent</span>}
                           </span>
                           {reason && <small>{reason}</small>}
-                          {((fullName && fullName !== label) ||
+                          {(remoteDetail ||
+                            otherName ||
                             managedBy ||
                             !members?.includes(recipient.pubkey)) && (
                             <small className="text-caption text-subtle">
-                              {/* A verified full name sits beside the detail. */}
+                              {/* The other verified name sits beside the detail. */}
                               {[
-                                fullName !== label ? fullName : undefined,
+                                otherName,
+                                remoteDetail,
                                 managedBy,
                                 members?.includes(recipient.pubkey)
                                   ? undefined
-                                  : inviteAgents
+                                  : inviteAgents &&
+                                      !outsideMentionReferences(
+                                        channel,
+                                        agents.identities,
+                                        recipient.pubkey,
+                                      )
                                     ? parentAdmission
                                       ? "Adds to channel when you send"
                                       : "Adds to chat when you send"
