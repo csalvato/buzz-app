@@ -1423,7 +1423,9 @@ available rather than silently discarding it.
   started from; Buzz leaves those as they are, and Claude itself doesn't go
   back to them once a settings file's headers are removed. Protected Claude
   agents are not attributed yet: their pinned launch ignores Claude's
-  settings files, including a gateway app's.
+  settings files, including a gateway app's. Claude agents running on a
+  remote execution target are not attributed either; Buzz leaves their
+  Claude settings alone.
 - **Agents → Your teams → Previous versions**, in a team's editor, lists the
   saved versions of a team that syncs to a community, the same way. Reverting
   restores its instructions and keeps its current name; members are not

@@ -7,6 +7,8 @@ import type { AgentExecution } from "../../features/agents/execution";
 import { ClaudeProcess } from "./claude";
 import { executionSpawn } from "./execution";
 import { ClaudeRuntime, DEFAULT_CONFIG } from "./runtime";
+import { REMOTE } from "./attribution";
+import { VECTOR_PROFILE } from "../../features/agents/gateway/vectors";
 import { localStore } from "../../features/agents/store";
 import { fileStore } from "../../features/agents/state";
 import type {
@@ -285,6 +287,7 @@ async function remoteFixture() {
     content = "hello",
     signal = new AbortController().signal,
     channel = "room",
+    gateway?: Delivery["gateway"],
   ) => {
     const event = {
       id: "c".repeat(64),
@@ -300,6 +303,7 @@ async function remoteFixture() {
       channelId: channel,
       trigger: { type: "mention", event },
       signal,
+      ...(gateway ? { gateway } : {}),
       workingUntil: (work: Promise<unknown>) => {
         handovers++;
         waits.push(work);
@@ -384,6 +388,56 @@ it("resumes a saved target before its first post-restart compaction and gives Ne
     expect(f.sessions[2]?.intent).toBe("new");
     expect(f.local).not.toHaveBeenCalled();
   } finally {
+    await f.cleanup();
+  }
+});
+
+it("leaves a remote agent's Claude settings alone on an eligible gateway turn and its compaction", async () => {
+  const f = await remoteFixture();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  // A route that would attribute the same agent's local process.
+  const gateway = {
+    route: {
+      kind: "eligible",
+      revision: 2,
+      gatewayOrigin: "https://gateway.example",
+      identity: {
+        community_id: "11111111-2222-4333-8444-555555555555",
+        human_pubkey: f.agent.owner,
+        agent_pubkey: f.agent.pubkey,
+      },
+      profile: VECTOR_PROFILE,
+      harnesses: ["claude-code"],
+    },
+    turn: { channel_id: null, message_id: "c".repeat(64), thread_id: null },
+    upstream: { base: "/claude" },
+  } as unknown as Delivery["gateway"];
+  try {
+    await f.deliver("hello", undefined, "room", gateway);
+    await f.runtime.session(f.agent, { channelId: "room" }, "compact");
+    const wires = await f.wires();
+    const settings = wires.filter((wire) => {
+      const request = wire.request as { subtype?: string } | undefined;
+      return (
+        wire.type === "control_request" &&
+        (request?.subtype === "get_settings" ||
+          request?.subtype === "apply_flag_settings")
+      );
+    });
+    expect(settings).toEqual([]);
+    // The turn and its compaction still ran remotely.
+    expect(
+      wires.some(
+        (wire) =>
+          wire.type === "user" &&
+          (wire.message as { content?: unknown }).content === "/compact",
+      ),
+    ).toBe(true);
+    expect(f.local).not.toHaveBeenCalled();
+    // Only the gateway turn says why; a compaction has no gateway here.
+    expect(warn).not.toHaveBeenCalledWith(REMOTE);
+  } finally {
+    warn.mockRestore();
     await f.cleanup();
   }
 });
