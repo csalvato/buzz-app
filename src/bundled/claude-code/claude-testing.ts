@@ -23,6 +23,13 @@ export type FakeClaude = {
   model: string;
   /** The model each user message was taken on. */
   models: string[];
+  /** Its effective settings env, which `get_settings` reports and
+   * `apply_flag_settings` merges over key by key. */
+  env: Record<string, string>;
+  /** The custom headers each user message was taken with. */
+  headers: (string | undefined)[];
+  /** When set, an `apply_flag_settings` that sets env is refused. */
+  refuseEnv?: boolean;
   /** When set, a turn stays open until `finish()`. */
   hold: boolean;
   killed: boolean;
@@ -64,8 +71,11 @@ export const CLAUDES: ReadonlySet<string> = new Set([
 
 /** A spawn whose Claude processes answer like Claude, on an Apple silicon
  * Mac. Sessions named in `known` (or created by a process) can be resumed;
- * others fail to load. */
-export function fakeSpawn(known = new Set<string>()) {
+ * others fail to load. Each starts with `env` as its settings' env. */
+export function fakeSpawn(
+  known = new Set<string>(),
+  env: Readonly<Record<string, string>> = {},
+) {
   const processes: FakeClaude[] = [];
   const spawn = async (id: string, options: HostProcessOptions = {}) => {
     if (id === "platform") {
@@ -100,6 +110,8 @@ export function fakeSpawn(known = new Set<string>()) {
       efforts: [],
       model: flag("--model") ?? "default",
       models: [],
+      env: { ...env },
+      headers: [],
       hold: false,
       killed: false,
       exitOnKill: true,
@@ -151,6 +163,22 @@ export function fakeSpawn(known = new Set<string>()) {
           typeof request.model === "string"
         )
           fake.model = request.model;
+        const env = (request.settings as Record<string, unknown> | undefined)
+          ?.env as Record<string, string> | undefined;
+        if (request.subtype === "apply_flag_settings" && env) {
+          if (fake.refuseEnv) {
+            fake.emit({
+              type: "control_response",
+              response: {
+                subtype: "error",
+                request_id: message.request_id,
+                error: "refused",
+              },
+            });
+            return;
+          }
+          Object.assign(fake.env, env);
+        }
         if (request.subtype === "interrupt" && fake.interruptError) {
           fake.emit({
             type: "control_response",
@@ -174,6 +202,7 @@ export function fakeSpawn(known = new Set<string>()) {
                       effort: fake.effort,
                       model: resolved(fake.model),
                     },
+                    effective: { env: { ...fake.env } },
                   },
                 }
               : {}),
@@ -193,6 +222,7 @@ export function fakeSpawn(known = new Set<string>()) {
       fake.prompts.push(content);
       fake.efforts.push(fake.effort);
       fake.models.push(fake.model);
+      fake.headers.push(fake.env.ANTHROPIC_CUSTOM_HEADERS);
       if (!started) {
         started = true;
         known.add(session);

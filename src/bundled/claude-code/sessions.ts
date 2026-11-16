@@ -271,6 +271,7 @@ export class AgentSessions {
       step,
       acknowledged,
       superseded,
+      submitted,
       activityScope,
     }: DeliveryOptions,
     handed: () => void,
@@ -329,6 +330,7 @@ export class AgentSessions {
         ...(step ? { step } : {}),
         ...(acknowledged ? { acknowledged } : {}),
         ...(superseded ? { superseded } : {}),
+        ...(submitted ? { submitted } : {}),
       };
       const answering = this.answer(
         key,
