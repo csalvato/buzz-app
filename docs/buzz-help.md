@@ -514,7 +514,9 @@ available rather than silently discarding it.
   point at the agent gateway adds Buzz's session, agent and conversation
   headers to each turn, keeping its other custom headers. Buzz never changes
   Claude's endpoint, sign-in or provider. A turn that can't be attributed
-  (another endpoint or provider, or settings Claude didn't report or take)
+  (another endpoint or provider, settings Claude didn't report or take, or
+  custom headers set only in the environment Buzz was started from, which
+  Buzz leaves as they are)
   still runs, and Activity notes "Not attributed in the agent gateway" with
   the reason. Protected Claude agents are not attributed yet: their pinned
   launch ignores Claude's settings files, including a gateway app's.

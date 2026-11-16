@@ -44,13 +44,17 @@ export type Baseline = Readonly<{
   endpoint: string | undefined;
   /** It selects a provider other than Anthropic's API. */
   provider: boolean;
+  /** Claude's inherited env sets custom headers, which its settings don't
+   * report; undefined when that couldn't be checked. */
+  inherited?: boolean | undefined;
 }>;
 
 const NOTICE = "Not attributed in the agent gateway";
 export const UNREADABLE = `${NOTICE}: Claude didn't report its settings.`;
-export const UNAPPLIED = `${NOTICE}: Claude didn't take this turn's headers, so it may still send an earlier turn's.`;
+export const UNAPPLIED = `${NOTICE}: Claude didn't take Buzz's header change, so it may still send an earlier turn's Buzz headers.`;
 export const PROVIDER = `${NOTICE}: Claude is set to use another provider.`;
 export const ELSEWHERE = `${NOTICE}: Claude's own endpoint isn't the agent gateway.`;
+export const INHERITED = `${NOTICE}: Claude's custom headers come from the app's environment, which Buzz can't read to keep them.`;
 export const PROTECTED = `${NOTICE}: protected Claude agents keep their own pinned launch.`;
 /** A shared-contract refusal (binding or context) as this turn's notice. */
 export const refused = (message: string) => `${NOTICE}: ${message}`;
@@ -76,7 +80,8 @@ export function readBaseline(answer: unknown): Baseline | undefined {
 }
 
 /** Why `baseline` can't carry attribution for `origin`, as a notice. The
- * origin is compared (scheme, host and port), never the mode path.
+ * origin is compared (scheme, host and port), never the mode path, and
+ * headers only Claude's inherited env sets are never replaced.
  * `provider` is what Claude's `initialize` resolved, which also sees a
  * selector in its process env; only Anthropic's API ("firstParty") or an
  * older Claude that reports none passes. */
@@ -88,6 +93,10 @@ export function ineligible(
   if (baseline.provider || (provider !== undefined && provider !== FIRST_PARTY))
     return PROVIDER;
   if (originOf(baseline.endpoint) !== originOf(origin)) return ELSEWHERE;
+  // A settings value outranks the inherited one, which then never reaches
+  // the endpoint; without one, applying ours would replace it for good.
+  if (baseline.headers === undefined && baseline.inherited !== false)
+    return baseline.inherited ? INHERITED : UNREADABLE;
 }
 
 /** `baseline`'s lines without any header reserved to Buzz, whatever its case

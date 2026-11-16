@@ -30,6 +30,8 @@ export type FakeClaude = {
   headers: (string | undefined)[];
   /** When set, an `apply_flag_settings` that sets env is refused. */
   refuseEnv?: boolean;
+  /** When set, an `apply_flag_settings` that sets env is never answered. */
+  ignoreEnv?: boolean;
   /** The `account.apiProvider` its `initialize` answer reports. */
   apiProvider: string;
   /** When set, a turn stays open until `finish()`. */
@@ -74,21 +76,29 @@ export const CLAUDES: ReadonlySet<string> = new Set([
 /** A spawn whose Claude processes answer like Claude, on an Apple silicon
  * Mac. Sessions named in `known` (or created by a process) can be resumed;
  * others fail to load. Each starts with `env` as its settings' env and
- * reports `apiProvider` at `initialize`. */
+ * reports `apiProvider` at `initialize`; `claude.sh`'s inherited-headers
+ * check answers `inherited`, or exits 1 for "fail". */
 export function fakeSpawn(
   known = new Set<string>(),
   env: Readonly<Record<string, string>> = {},
-  apiProvider = "firstParty",
+  {
+    apiProvider = "firstParty",
+    inherited = "unset",
+  }: { apiProvider?: string; inherited?: "set" | "unset" | "fail" } = {},
 ) {
   const processes: FakeClaude[] = [];
   const spawn = async (id: string, options: HostProcessOptions = {}) => {
-    if (id === "platform") {
-      options.onStdout?.("Darwin arm64\n");
+    if (id === "platform" || id === "inherited-headers") {
+      const fails = id === "inherited-headers" && inherited === "fail";
+      if (!fails)
+        options.onStdout?.(
+          id === "platform" ? "Darwin arm64\n" : `${inherited}\n`,
+        );
       return {
         write: async () => {},
         end: async () => {},
         kill: async () => {},
-        exited: Promise.resolve(0),
+        exited: Promise.resolve(fails ? 1 : 0),
       };
     }
     let resolveExit!: (code: number | null) => void;
@@ -171,6 +181,7 @@ export function fakeSpawn(
         const env = (request.settings as Record<string, unknown> | undefined)
           ?.env as Record<string, string> | undefined;
         if (request.subtype === "apply_flag_settings" && env) {
+          if (fake.ignoreEnv) return;
           if (fake.refuseEnv) {
             fake.emit({
               type: "control_response",

@@ -136,6 +136,34 @@ export const ENV: Readonly<Record<string, string | null>> = {
   CLAUDE_PID: null,
 };
 
+/** How long `claude.sh`'s inherited-headers check may take. */
+const INHERITED_CHECK_MS = 15_000;
+/** How long a turn or compaction waits on one attribution control call
+ * before going on unattributed. */
+const ATTRIBUTION_CALL_MS = 5_000;
+
+/** Whether the env `spawn` starts Claude with sets its custom headers, from
+ * `claude.sh`'s presence-only check; undefined when the check fails. */
+async function setsInheritedHeaders(spawn: Spawn) {
+  let answer = "";
+  try {
+    const check = await spawn("inherited-headers", {
+      env: ENV,
+      onStdout: (data) => {
+        answer += data;
+      },
+    });
+    const timer = setTimeout(() => void check.kill(), INHERITED_CHECK_MS);
+    const code = await check.exited;
+    clearTimeout(timer);
+    if (code !== 0) return undefined;
+  } catch {
+    return undefined;
+  }
+  const presence = answer.trim();
+  return presence === "set" ? true : presence === "unset" ? false : undefined;
+}
+
 export class ClaudeProcess {
   private protection: ClaudeProtection | undefined;
   private protectionLifetime = new AbortController();
@@ -204,10 +232,13 @@ export class ClaudeProcess {
   private readingEffort: Promise<void> | undefined;
   /** Its own settings, read once before Buzz's first attribution. */
   private baseline: Promise<Baseline | undefined> | undefined;
+  /** Whether its inherited env sets custom headers; undefined if unknown. */
+  private inherited: () => Promise<boolean | undefined> = async () => undefined;
   /** The provider `initialize` reported, such as "firstParty". */
   private provider: Promise<string | undefined> = Promise.resolve(undefined);
-  /** The custom headers Buzz last applied; undefined while it applied none. */
-  private attributed: string | undefined;
+  /** The custom headers Buzz last applied; undefined while it applied none,
+   * null when a change it asked for may or may not have taken. */
+  private attributed: string | null | undefined;
   readonly exited: Promise<number | null>;
 
   private constructor(
@@ -400,6 +431,9 @@ export class ClaudeProcess {
       launch.hook,
     );
     claude.protection = launch.protection;
+    // Checked once, only when Buzz first attributes this process.
+    let inherited: Promise<boolean | undefined> | undefined;
+    claude.inherited = () => (inherited ??= setsInheritedHeaders(spawn));
     claude.resuming = !!launch.resume;
     claude.protectedInstructions = launch.systemPrompt ?? "";
     for (const data of earlyErrors) claude.readError(data);
@@ -565,10 +599,10 @@ export class ClaudeProcess {
   ): Promise<string | undefined> {
     if (!attribution && this.attributed === undefined) return;
     // Read before Buzz's first change, so it is always the person's own.
-    this.baseline ??= this.call({ subtype: "get_settings" }).then(
-      readBaseline,
-      () => undefined,
-    );
+    this.baseline ??= Promise.all([
+      this.attributionCall({ subtype: "get_settings" }).then(readBaseline),
+      this.inherited(),
+    ]).then(([baseline, inherited]) => baseline && { ...baseline, inherited });
     const baseline = await this.baseline;
     if (!baseline) return attribution && UNREADABLE;
     const reason =
@@ -582,16 +616,37 @@ export class ClaudeProcess {
             attribution.headers,
           )
         : (baseline.headers ?? "");
-    if (headers === (this.attributed ?? baseline.headers ?? "")) return reason;
+    const current =
+      this.attributed === undefined
+        ? (baseline.headers ?? "")
+        : this.attributed;
+    if (headers === current) return reason;
     // Only the one env key: Claude merges flag settings key by key, so its
     // endpoint, sign-in, effort and model stay as they are.
-    const answer = await this.call({
+    const answer = await this.attributionCall({
       subtype: "apply_flag_settings",
       settings: { env: { ANTHROPIC_CUSTOM_HEADERS: headers } },
-    }).catch(() => undefined);
-    if (answer?.subtype !== "success") return UNAPPLIED;
-    this.attributed = headers;
-    return reason;
+    });
+    // Unknown until a later change takes, which a restore then still sends.
+    this.attributed = answer.subtype === "success" ? headers : null;
+    return answer.subtype === "success" ? reason : UNAPPLIED;
+  }
+
+  /** A control call attribution makes, answered as an error when it fails or
+   * Claude takes longer than `ATTRIBUTION_CALL_MS`, so it never holds up the
+   * turn or compaction waiting on it. */
+  private attributionCall(request: Message): Promise<Message> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<Message>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ subtype: "error", error: "timed out" }),
+        ATTRIBUTION_CALL_MS,
+      );
+    });
+    return Promise.race([
+      this.call(request).catch(() => ({ subtype: "error" })),
+      late,
+    ]).finally(() => clearTimeout(timer));
   }
 
   /** Sends one user message. Resolves when it, and anything sent after it, has

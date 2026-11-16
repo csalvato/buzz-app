@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { inferenceBundle } from "../../features/agents/gateway/contract";
 import {
   VECTOR_BINDING,
@@ -7,10 +7,13 @@ import {
 import {
   customHeaders,
   ELSEWHERE,
+  INHERITED,
   ineligible,
   PROVIDER,
   PROVIDERS,
   readBaseline,
+  UNAPPLIED,
+  UNREADABLE,
 } from "./attribution";
 import { ClaudeProcess } from "./claude";
 import { fakeSpawn } from "./claude-testing";
@@ -73,6 +76,7 @@ describe("ineligible", () => {
     headers: undefined,
     endpoint,
     provider,
+    inherited: false,
   });
 
   it("accepts the gateway's origin on either mode path", () => {
@@ -95,6 +99,19 @@ describe("ineligible", () => {
     ])
       expect(ineligible(baseline(endpoint), GATEWAY)).toBe(ELSEWHERE);
     expect(ineligible(baseline(`${GATEWAY}/a`, true), GATEWAY)).toBe(PROVIDER);
+  });
+
+  it("never replaces headers only the inherited env sets", () => {
+    const endpoint = `${GATEWAY}/a`;
+    const own = { ...baseline(endpoint), inherited: true };
+    expect(ineligible(own, GATEWAY)).toBe(INHERITED);
+    expect(ineligible({ ...own, inherited: undefined }, GATEWAY)).toBe(
+      UNREADABLE,
+    );
+    // A settings value outranks the inherited one, so it is the baseline.
+    expect(ineligible({ ...own, headers: "x-keep: 1" }, GATEWAY)).toBe(
+      undefined,
+    );
   });
 });
 
@@ -125,8 +142,11 @@ describe("ClaudeProcess.attribute", () => {
       .map((message) => (message.request as { subtype?: string })?.subtype)
       .filter(Boolean);
 
-  async function started(env: Record<string, string>, provider?: string) {
-    const { spawn, processes } = fakeSpawn(undefined, env, provider);
+  async function started(
+    env: Record<string, string>,
+    check: Parameters<typeof fakeSpawn>[2] = {},
+  ) {
+    const { spawn, processes } = fakeSpawn(undefined, env, check);
     const claude = await ClaudeProcess.start(spawn, launch);
     const fake = processes[0];
     if (!fake) throw new Error("no process");
@@ -188,7 +208,7 @@ describe("ClaudeProcess.attribute", () => {
       PROVIDER,
     );
     // A selector in Claude's process env shows only in what it resolved.
-    const resolved = await started(ON_GATEWAY, "bedrock");
+    const resolved = await started(ON_GATEWAY, { apiProvider: "bedrock" });
     await expect(resolved.claude.attribute(attribution(null))).resolves.toBe(
       PROVIDER,
     );
@@ -196,11 +216,62 @@ describe("ClaudeProcess.attribute", () => {
       expect(subtypes(fake.received)).not.toContain("apply_flag_settings");
   });
 
+  it("leaves inherited-only headers alone, and keeps a settings value over them", async () => {
+    const { ANTHROPIC_BASE_URL } = ON_GATEWAY;
+    const only = await started({ ANTHROPIC_BASE_URL }, { inherited: "set" });
+    await expect(only.claude.attribute(attribution(null))).resolves.toBe(
+      INHERITED,
+    );
+    await expect(only.claude.send("still runs")).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(only.claude.attribute(undefined)).resolves.toBeUndefined();
+    expect(subtypes(only.fake.received)).not.toContain("apply_flag_settings");
+    const unchecked = await started(
+      { ANTHROPIC_BASE_URL },
+      { inherited: "fail" },
+    );
+    await expect(unchecked.claude.attribute(attribution(null))).resolves.toBe(
+      UNREADABLE,
+    );
+    // Settings headers win over inherited ones: updated, then restored.
+    const both = await started(ON_GATEWAY, { inherited: "set" });
+    await both.claude.attribute(attribution("1".repeat(64)));
+    await both.claude.send("first");
+    await both.claude.attribute(attribution("2".repeat(64)));
+    await both.claude.send("second");
+    await both.claude.attribute(undefined);
+    await both.claude.send("third");
+    const [first, second, third] = both.fake.headers;
+    expect(first).toContain(`x-gw-ctx-message-id: ${"1".repeat(64)}`);
+    expect(second).toContain(`x-gw-ctx-message-id: ${"2".repeat(64)}`);
+    expect(third).toBe("x-keep: configured");
+  });
+
+  it("goes on unattributed when Claude doesn't answer, and restores after", async () => {
+    const { claude, fake } = await started(ON_GATEWAY);
+    await claude.attribute(attribution("1".repeat(64)));
+    fake.ignoreEnv = true;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const pending = claude.attribute(attribution("2".repeat(64)));
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(pending).resolves.toBe(UNAPPLIED);
+    } finally {
+      vi.useRealTimers();
+    }
+    fake.ignoreEnv = false;
+    // Whatever Claude took, the restore is still sent.
+    await claude.attribute(undefined);
+    await claude.send("restored");
+    expect(fake.headers).toEqual(["x-keep: configured"]);
+  });
+
   it("reports a refused update without failing the turn", async () => {
     const { claude, fake } = await started(ON_GATEWAY);
     fake.refuseEnv = true;
     await expect(claude.attribute(attribution(null))).resolves.toMatch(
-      /didn't take this turn's headers/,
+      /didn't take Buzz's header change/,
     );
     await expect(claude.send("still runs")).resolves.toMatchObject({
       ok: true,

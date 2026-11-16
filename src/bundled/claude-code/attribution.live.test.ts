@@ -15,7 +15,9 @@ import {
   VECTOR_PROFILE,
 } from "../../features/agents/gateway/vectors";
 import type { HostProcessOptions } from "../../features/host/service";
+import { INHERITED } from "./attribution";
 import { ClaudeProcess, type Spawn } from "./claude";
+import script from "./claude.sh?raw";
 
 const BIN = process.env.CLAUDE_LIVE_BIN;
 const MODEL = "claude-sonnet-4-6";
@@ -71,8 +73,13 @@ let origin = "";
 const folders: string[] = [];
 
 /** A spawn of the real binary in an isolated config folder whose settings
- * point it at the stand-in, as a person's gateway setup does. */
-function isolated(settings: Record<string, string>): Spawn {
+ * point it at the stand-in, as a person's gateway setup does, with
+ * `inherited` in its env as from the app's. `claude.sh`'s inherited-headers
+ * check runs as itself, in the same env. */
+function isolated(
+  settings: Record<string, string>,
+  inherited: Record<string, string> = {},
+): Spawn {
   const home = mkdtempSync(join(tmpdir(), "buzz-attribution-"));
   folders.push(home);
   writeFileSync(
@@ -80,7 +87,10 @@ function isolated(settings: Record<string, string>): Spawn {
     JSON.stringify({ env: { ANTHROPIC_BASE_URL: origin, ...settings } }),
   );
   return async (_id, options: HostProcessOptions = {}) => {
-    const env: Record<string, string | undefined> = { PATH: process.env.PATH };
+    const env: Record<string, string | undefined> = {
+      PATH: process.env.PATH,
+      ...inherited,
+    };
     for (const [key, value] of Object.entries(options.env ?? {}))
       if (value !== null) env[key] = value;
     Object.assign(env, {
@@ -91,7 +101,11 @@ function isolated(settings: Record<string, string>): Spawn {
       NO_PROXY: "127.0.0.1,localhost",
       no_proxy: "127.0.0.1,localhost",
     });
-    const child = spawnChild(BIN ?? "claude", options.args ?? [], {
+    const [program, args] =
+      _id === "inherited-headers"
+        ? ["bash", ["-c", script, "claude.sh", "inherited-headers"]]
+        : [BIN ?? "claude", options.args ?? []];
+    const child = spawnChild(program, args, {
       cwd: home,
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -181,6 +195,57 @@ describe.skipIf(!BIN)("claude attribution", () => {
       }
     } finally {
       await claude.kill();
+    }
+  });
+
+  it("leaves headers only the inherited env sets, and prefers settings over them", {
+    timeout: 120_000,
+  }, async () => {
+    const launch = {
+      cwd: "/",
+      systemPrompt: "Answer in one word.",
+      model: MODEL,
+    };
+    const own = { ANTHROPIC_CUSTOM_HEADERS: "x-inherited-live: env" };
+    const only = await ClaudeProcess.start(isolated({}, own), launch);
+    try {
+      await expect(only.attribute(attribution("4".repeat(64)))).resolves.toBe(
+        INHERITED,
+      );
+      const kept = await turn(only, "Reply with one word.");
+      await expect(only.attribute(undefined)).resolves.toBeUndefined();
+      const after = [...kept, ...(await turn(only, "Reply again."))];
+      expect(after.length).toBeGreaterThan(1);
+      for (const headers of after) {
+        expect(headers["x-inherited-live"]).toBe("env");
+        expect(headers[roles.launcher_session]).toBeUndefined();
+      }
+    } finally {
+      await only.kill();
+    }
+    // A settings value outranks the inherited one, so it is the baseline.
+    const both = await ClaudeProcess.start(
+      isolated({ ANTHROPIC_CUSTOM_HEADERS: "x-keep-live: configured" }, own),
+      launch,
+    );
+    try {
+      await expect(
+        both.attribute(attribution("5".repeat(64))),
+      ).resolves.toBeUndefined();
+      const attributed = await turn(both, "Reply with one word.");
+      await both.attribute(undefined);
+      const restored = await turn(both, "Reply again.");
+      expect(attributed.map((headers) => headers[roles.message_id])).toContain(
+        "5".repeat(64),
+      );
+      for (const headers of [...attributed, ...restored]) {
+        expect(headers["x-keep-live"]).toBe("configured");
+        expect(headers["x-inherited-live"]).toBeUndefined();
+      }
+      for (const headers of restored)
+        expect(headers[roles.launcher_session]).toBeUndefined();
+    } finally {
+      await both.kill();
     }
   });
 

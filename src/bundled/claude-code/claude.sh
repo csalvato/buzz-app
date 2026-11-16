@@ -8,6 +8,8 @@
 #   use VERSION                      makes a downloaded release the one in use
 #   review-token                     saves security reviews' sign-in from stdin
 #   review                           prints their folder, then that sign-in
+#   inherited-headers                prints whether the app's environment sets
+#                                    Claude's custom headers, never their value
 set -eu
 
 # Shared by every Buzz build on this computer, so there is one download.
@@ -165,6 +167,11 @@ review)
   if [ -f "$review/token" ] && [ ! -h "$review/token" ]; then
     cat "$review/token"
   fi
+  ;;
+inherited-headers)
+  # Claude's settings don't report its process env, and a flag setting
+  # replaces this for good, so Buzz checks for it here: presence only.
+  if [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then echo set; else echo unset; fi
   ;;
 *)
   echo "Unknown command: $command" >&2
