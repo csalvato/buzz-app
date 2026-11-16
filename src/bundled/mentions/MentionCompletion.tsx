@@ -253,8 +253,10 @@ export function MentionCompletion({
                 ? guests.has(recipient.pubkey)
                   ? guestMentionDetail(
                       !!agent,
-                      profiles.get(recipient.pubkey)?.ownerPubkey ===
-                        session.viewer,
+                      // Signature-checked, as the send's dialog decides.
+                      !!session.viewer &&
+                        session.profiles.owner?.(recipient.pubkey) ===
+                          session.viewer,
                     )
                   : undefined
                 : inviteAgents &&

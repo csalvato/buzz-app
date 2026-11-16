@@ -412,6 +412,105 @@ test("a Solo chat the relay refuses gives the question back", async ({
   expect(errors.unexplained()).toEqual([]);
 });
 
+test("a refused chat gives the question back when clearing the draft had failed", async ({
+  page,
+}) => {
+  const errors = watchPageErrors(page);
+  await page.goto(
+    "/tests/fixtures/guest-agent-solo-ask.html?refuse-create=held",
+  );
+  await page
+    .getByRole("button", { name: "Launch channel", exact: true })
+    .click();
+  const composer = page.getByRole("textbox", { name: "Message launch" });
+  await mention(page, composer, "are we still on for Thursday?");
+  // The saved question can't be replaced with the cleared draft.
+  await page.evaluate(() => {
+    const set = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (window.failDraftWrites && key.includes('"draft:'))
+        throw new DOMException("Storage is full.", "QuotaExceededError");
+      return set.call(this, key, value);
+    };
+    window.failDraftWrites = true;
+  });
+  await page.keyboard.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "Pollen can’t reply here" });
+  await dialog.getByRole("button", { name: "Ask in a Solo chat" }).click();
+  const cleanup = page.getByRole("button", { name: "Retry draft cleanup" });
+  await expect(cleanup).toBeVisible();
+  await page.evaluate(() => window.refuseCreate());
+  await expect(
+    page.getByRole("dialog", {
+      name: "Couldn’t start your Solo chat with Pollen, so the question wasn’t sent. It’s back in your draft in #launch.",
+    }),
+  ).toBeVisible();
+  await expect(composer).toContainText("are we still on for Thursday?");
+  // The cleanup is retired with the ask, so it can't erase the question.
+  await expect(cleanup).toHaveCount(0);
+  await page.evaluate(() => {
+    window.failDraftWrites = false;
+  });
+  await composer.click();
+  await page.keyboard.press("End");
+  await page.keyboard.type(" Or Friday?");
+  await expect(composer).toContainText(
+    "are we still on for Thursday? Or Friday?",
+  );
+  expect(errors.unexplained()).toEqual([]);
+});
+
+for (const away of [false, true])
+  test(`a file added while the chat starts keeps its draft when the relay refuses${
+    away ? ", after the composer remounts" : ""
+  }`, async ({ page }) => {
+    const errors = watchPageErrors(page);
+    await page.goto(
+      "/tests/fixtures/guest-agent-solo-ask.html?refuse-create=held&files",
+    );
+    const launch = page.getByRole("button", {
+      name: "Launch channel",
+      exact: true,
+    });
+    await launch.click();
+    const composer = page.getByRole("textbox", { name: "Message launch" });
+    await mention(page, composer, "are we still on for Thursday?");
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", {
+      name: "Pollen can’t reply here",
+    });
+    await dialog.getByRole("button", { name: "Ask in a Solo chat" }).click();
+    await expect(composer).not.toContainText("Thursday");
+    const form = page.locator("form").filter({ has: composer });
+    await form.getByLabel("Choose attachments").setInputFiles({
+      name: "later.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("later"),
+    });
+    await expect(
+      form.getByRole("button", { name: "Remove later.txt" }),
+    ).toBeVisible();
+    if (away)
+      await page
+        .getByRole("button", { name: "Design channel", exact: true })
+        .click();
+    await page.evaluate(() => window.refuseCreate());
+    // The newer file draft is the author's: the question isn't put back in it.
+    await expect(
+      page.getByRole("dialog", {
+        name: "Couldn’t start your Solo chat with Pollen, so the question wasn’t sent.",
+        exact: true,
+      }),
+    ).toBeVisible();
+    if (away) await launch.click();
+    await expect(
+      form.getByRole("button", { name: "Remove later.txt" }),
+    ).toBeVisible();
+    await expect(composer).not.toContainText("Thursday");
+    await expect(composer.getByText("@Pollen")).toHaveCount(0);
+    expect(errors.unexplained()).toEqual([]);
+  });
+
 test("the question's skill and folder chips go with it to the Solo chat", async ({
   page,
 }) => {
@@ -455,36 +554,44 @@ test("the question's skill and folder chips go with it to the Solo chat", async 
   expect(errors.unexplained()).toEqual([]);
 });
 
-test("someone else's Viewing-only agent sends as before, with no dialog", async ({
-  page,
-}, testInfo) => {
-  const errors = watchPageErrors(page);
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto("/tests/fixtures/guest-agent-solo-ask.html?guest=other");
-  await page
-    .getByRole("button", { name: "Launch channel", exact: true })
-    .click();
-  const composer = page.getByRole("textbox", { name: "Message launch" });
-  await composer.click();
-  await page.keyboard.type("@Poll");
-  const row = page.getByRole("option", { name: /^Pollen / });
-  await expect(row).toContainText("Viewing only · Can’t reply here");
-  await expect(row).not.toContainText("Bestie");
-  await shot(page, "12-other-chooser", testInfo);
-  await row.click();
-  await page.keyboard.type(" can you take a look?");
-  await page.keyboard.press("Enter");
-  await expect(
-    page
-      .getByRole("region", { name: "launch", exact: true })
-      .locator("[data-message-id]")
-      .filter({ hasText: "can you take a look?" }),
-  ).toHaveCount(1);
-  // Its owner decides whether it joins; the viewer isn't asked.
-  await expect(page.getByRole("dialog")).toHaveCount(0);
-  await shot(page, "13-other-sent", testInfo);
-  expect(errors.unexplained()).toEqual([]);
-});
+for (const [guest, title] of [
+  [
+    "other",
+    "someone else's Viewing-only agent sends as before, with no dialog",
+  ],
+  [
+    "forged",
+    "an agent whose profile falsely names you as owner is someone else's: no dialog",
+  ],
+])
+  test(title, async ({ page }, testInfo) => {
+    const errors = watchPageErrors(page);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/tests/fixtures/guest-agent-solo-ask.html?guest=${guest}`);
+    await page
+      .getByRole("button", { name: "Launch channel", exact: true })
+      .click();
+    const composer = page.getByRole("textbox", { name: "Message launch" });
+    await composer.click();
+    await page.keyboard.type("@Poll");
+    const row = page.getByRole("option", { name: /^Pollen / });
+    await expect(row).toContainText("Viewing only · Can’t reply here");
+    await expect(row).not.toContainText("Bestie");
+    if (guest === "other") await shot(page, "12-other-chooser", testInfo);
+    await row.click();
+    await page.keyboard.type(" can you take a look?");
+    await page.keyboard.press("Enter");
+    await expect(
+      page
+        .getByRole("region", { name: "launch", exact: true })
+        .locator("[data-message-id]")
+        .filter({ hasText: "can you take a look?" }),
+    ).toHaveCount(1);
+    // Its owner decides whether it joins; the viewer isn't asked.
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    if (guest === "other") await shot(page, "13-other-sent", testInfo);
+    expect(errors.unexplained()).toEqual([]);
+  });
 
 test("a cold start labels the Viewing-only agent once the relay confirms membership", async ({
   page,

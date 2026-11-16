@@ -20,7 +20,7 @@ import {
   summary,
   profile,
 } from "../../src/features/relay/testing";
-import type { RelayEvent } from "../../src/features/relay/events";
+import { eventDto, type RelayEvent } from "../../src/features/relay/events";
 import { PublishRejected } from "../../src/features/relay/outbox";
 import type { LiveCallbacks } from "../../src/features/relay/live";
 import { matchesEvent } from "../../src/features/relay/projection";
@@ -61,10 +61,24 @@ const outside = params.get("guest") === "outside";
 const cold = params.get("guest") === "cold";
 // `guest=other`: Pollen is Viewing only in #launch, but someone else owns it.
 const other = params.get("guest") === "other";
+// `guest=forged`: Pollen's profile names the viewer as its owner, but the
+// owner signature is someone else's, so the claim is false.
+const forged = params.get("guest") === "forged";
 // `refuse`: the relay refuses role changes, as for a viewer no longer an admin.
 const refuse = params.has("refuse");
 // `refuse-create`: the relay refuses to make a Solo chat (kind 9007).
+// `refuse-create=held`: it answers only when the walk calls `refuseCreate()`.
 const refuseCreate = params.has("refuse-create");
+let releaseRefusal = () => {};
+const refusal =
+  params.get("refuse-create") === "held"
+    ? new Promise<void>((resolve) => {
+        releaseRefusal = resolve;
+      })
+    : undefined;
+Object.assign(window, { refuseCreate: () => releaseRefusal() });
+// `files`: the composer can attach files; uploads never finish.
+const files = params.has("files");
 // `chips`: #launch's saved draft holds a skill and a folder chip.
 const chips = params.has("chips");
 let confirmMembership = () => {};
@@ -101,7 +115,7 @@ const ownerSignature = bytesToHex(
         new TextEncoder().encode(`nostr:agent-auth:${agent.pubkey}:`),
       ),
     ),
-    (other ? authority : viewer).secret,
+    (other || forged ? authority : viewer).secret,
   ),
 );
 const events: RelayEvent[] = [
@@ -137,15 +151,19 @@ const events: RelayEvent[] = [
     participants: [viewer.pubkey],
   }),
   profile(viewer, { name: "You" }),
-  signed(agent, {
-    kind: 0,
-    content: JSON.stringify({ name: "Pollen", bot: true }),
-    created_at: 1_700_000_000,
-    tags: [["auth", (other ? authority : viewer).pubkey, "", ownerSignature]],
-  }),
+  // Read through the relay's checks, as a relay read is, so its owner
+  // attestation is verified.
+  eventDto(
+    signed(agent, {
+      kind: 0,
+      content: JSON.stringify({ name: "Pollen", bot: true }),
+      created_at: 1_700_000_000,
+      tags: [["auth", (other ? authority : viewer).pubkey, "", ownerSignature]],
+    }),
+  ),
 ];
 const local = localAgentsFixture(
-  other
+  other || forged
     ? []
     : [
         {
@@ -249,6 +267,7 @@ const owner = createRelaySession(
       live = callbacks;
       return { update() {}, retry() {}, dispose() {} };
     },
+    ...(files ? { uploadAttachment: () => new Promise<never>(() => {}) } : {}),
     query: async (filters) => {
       if (
         confirmed &&
@@ -331,8 +350,10 @@ const owner = createRelaySession(
           return;
         }
         if (event.kind === 9007) {
-          if (refuseCreate)
+          if (refuseCreate) {
+            await refusal;
             throw new PublishRejected("Solo chats are off in this community.");
+          }
           create(event);
         }
         const channel = event.tags.find(([tag]) => tag === "h")?.[1];
@@ -405,7 +426,7 @@ if (chips) {
 }
 live?.state({ status: "connected", routes: [] });
 // Someone else's agent is never the viewer's Bestie.
-if (!other) setDefaultAgent(owner.session.scope, agent.pubkey);
+if (!other && !forged) setDefaultAgent(owner.session.scope, agent.pubkey);
 const snapshot = {
   status: "ready" as const,
   generation: 1,

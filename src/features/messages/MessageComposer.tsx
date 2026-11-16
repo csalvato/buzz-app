@@ -101,6 +101,7 @@ import { useVoiceCapture } from "./useVoiceCapture";
 import { ComposerAttachments } from "./ComposerAttachments";
 import {
   attachmentDraft,
+  attachmentDraftCount,
   useAttachmentDraft,
   type AttachmentDraft,
 } from "./attachment-draft";
@@ -2962,7 +2963,12 @@ function Composer({
                       pubkey: person.pubkey,
                       name: person.name,
                       reason,
-                      own: profile.ownerPubkey === session.viewer,
+                      // The signature-checked owner: `ownerPubkey` is only
+                      // what the profile claims.
+                      own:
+                        !!session.viewer &&
+                        session.profiles.owner?.(person.pubkey) ===
+                          session.viewer,
                     },
                   ]
                 : [];
@@ -3050,6 +3056,10 @@ function Composer({
                 channelName: here.name,
                 ...(threadRootId ? { threadRootId } : {}),
                 ...(tokens.length ? { tokens } : {}),
+                // The model and effort chosen for this agent go with it.
+                ...(capturedRunPicks[agent.pubkey]
+                  ? { pick: capturedRunPicks[agent.pubkey] }
+                  : {}),
               });
               // The question moved to the Solo chat; clear it like a send.
               const handed = {
@@ -3085,12 +3095,38 @@ function Composer({
                   if (!(reason instanceof ChatNotStarted)) return;
                   const failed = `Couldn’t start your Solo chat with ${agent.name}, so the question wasn’t sent.`;
                   const current = viewRevision(scope, draftKey);
-                  const restored =
+                  const question = JSON.stringify(captured);
+                  // Still the question: clearing it after the ask failed.
+                  const unchanged =
+                    current === question ||
+                    (current === savedRevision && current !== null);
+                  // Only the cleared draft, or the question itself, is
+                  // replaced. Files live outside the saved draft, so a file
+                  // added since (here or after a remount) is checked in the
+                  // draft's attachment store, as background-send recovery
+                  // does.
+                  const recoverable =
                     current !== undefined &&
-                    (current === null || blankDraft(current)) &&
+                    (unchanged || current === null || blankDraft(current)) &&
                     (!live.current ||
                       blankDraft(JSON.stringify(valueRef.current))) &&
-                    replaceView(scope, draftKey, current, captured) === "saved";
+                    !attachmentDraftCount(session, recoveryKey);
+                  // The failed cleanup is retired first, so the editor
+                  // unlocks and "Retry draft cleanup" never writes the empty
+                  // draft over the question.
+                  if (
+                    recoverable &&
+                    recoveryFor(session).get(recoveryKey) === handed
+                  )
+                    recoveryFor(session).delete(recoveryKey);
+                  // A saved question that can't be rewritten still stands.
+                  const restored =
+                    recoverable &&
+                    current !== undefined &&
+                    (current === question ||
+                      replaceView(scope, draftKey, current, captured) ===
+                        "saved" ||
+                      unchanged);
                   if (restored)
                     notifyRecovered(session, recoveryKey, {
                       draft: captured,

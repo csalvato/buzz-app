@@ -6,6 +6,7 @@ import { readDefaultLifetime } from "../solo/default-lifetime";
 import { readView, writeView } from "../../shared/view-state";
 import { messageCopyLink } from "./message-copy";
 import type { ComposerToken } from "./composer-token";
+import type { RunPick } from "../relay/messages";
 import { signMessageTokens } from "./message-tokens";
 
 /** A question for an agent that can't reply where it was written (Viewing
@@ -18,6 +19,9 @@ export type SoloAsk = {
   threadRootId?: string | undefined;
   /** The question's chips, signed with it as an ordinary send signs them. */
   tokens?: readonly ComposerToken[] | undefined;
+  /** The model and effort chosen for the agent's run, sent as an ordinary
+   * send sends them. */
+  pick?: RunPick | undefined;
 };
 
 /** Lowercase words joined by single hyphens, with no `#`, spaces or marks. */
@@ -181,7 +185,17 @@ export function askInSolo(
     ));
   }
   signMessageTokens(ask.tokens ?? [], () =>
-    session.messages.send(channelId, text, [ask.agent.pubkey]),
+    ask.pick
+      ? session.messages.send(
+          channelId,
+          text,
+          [ask.agent.pubkey],
+          [],
+          undefined,
+          [],
+          { [ask.agent.pubkey]: ask.pick },
+        )
+      : session.messages.send(channelId, text, [ask.agent.pubkey]),
   );
   return { channelId, reused: !!existing, ready };
 }

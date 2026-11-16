@@ -264,3 +264,14 @@ it("signs the question's chips, as an ordinary send does", () => {
   askInSolo(f.session, ask());
   expect(f.send.mock.results[1]?.value).toEqual([]);
 });
+
+it("sends the model and effort chosen for the agent, as an ordinary send does", () => {
+  const f = fakeSession();
+  askInSolo(f.session, ask({ pick: { model: "opus", effort: "high" } }));
+  expect(f.send.mock.lastCall?.[6]).toEqual({
+    [agent]: { model: "opus", effort: "high" },
+  });
+  // Without a choice the agent runs with its defaults.
+  askInSolo(f.session, ask());
+  expect(f.send.mock.lastCall).toHaveLength(3);
+});
