@@ -1403,6 +1403,9 @@ available rather than silently discarding it.
   (`team_update`). A proposal opens a review: nothing changes until you save
   it, members never change this way, and Save is refused if the team changed
   since the proposal.
+  Agent reads also show saved model and thinking choices for supported local
+  harnesses. They distinguish explicit choices, harness defaults, Recommended
+  policy and unavailable settings. They do not report an active turn's model.
 - **Activity**, where the agent type provides it, shows sessions and their
   transcripts in the agent's profile. An open transcript updates by itself
   while the agent works; **Refresh transcript** stays at the top as you scroll.
