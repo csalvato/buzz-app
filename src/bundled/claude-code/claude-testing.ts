@@ -30,8 +30,10 @@ export type FakeClaude = {
   headers: (string | undefined)[];
   /** When set, an `apply_flag_settings` that sets env is refused. */
   refuseEnv?: boolean;
-  /** When set, an `apply_flag_settings` that sets env is never answered. */
-  ignoreEnv?: boolean;
+  /** Control requests of this subtype go unanswered until `answerLate()`. */
+  withhold?: string | undefined;
+  /** Takes the withheld control requests, as a late Claude would. */
+  answerLate(): void;
   /** The `account.apiProvider` its `initialize` answer reports. */
   apiProvider: string;
   /** When set, a turn stays open until `finish()`. */
@@ -130,6 +132,7 @@ export function fakeSpawn(
       hold: false,
       killed: false,
       exitOnKill: true,
+      answerLate: () => {},
       emit(message) {
         if (alive) options.onStdout?.(`${JSON.stringify(message)}\n`);
       },
@@ -159,11 +162,22 @@ export function fakeSpawn(
         resolveExit(code);
       },
     };
+    const withheld: Record<string, unknown>[] = [];
+    fake.answerLate = () => {
+      const withhold = fake.withhold;
+      fake.withhold = undefined;
+      for (const message of withheld.splice(0)) take(message);
+      fake.withhold = withhold;
+    };
     processes.push(fake);
     const take = (message: Record<string, unknown>) => {
       fake.received.push(message);
       if (message.type === "control_request") {
         const request = message.request as Record<string, unknown>;
+        if (request.subtype === fake.withhold) {
+          withheld.push(message);
+          return;
+        }
         const level = (request.settings as Record<string, unknown> | undefined)
           ?.effortLevel;
         if (
@@ -181,7 +195,6 @@ export function fakeSpawn(
         const env = (request.settings as Record<string, unknown> | undefined)
           ?.env as Record<string, string> | undefined;
         if (request.subtype === "apply_flag_settings" && env) {
-          if (fake.ignoreEnv) return;
           if (fake.refuseEnv) {
             fake.emit({
               type: "control_response",

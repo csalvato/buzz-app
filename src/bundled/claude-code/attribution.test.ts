@@ -248,30 +248,72 @@ describe("ClaudeProcess.attribute", () => {
     expect(third).toBe("x-keep: configured");
   });
 
-  it("goes on unattributed when Claude doesn't answer, and restores after", async () => {
-    const { claude, fake } = await started(ON_GATEWAY);
-    await claude.attribute(attribution("1".repeat(64)));
-    fake.ignoreEnv = true;
+  /** `pending` once Claude has had longer than attribution waits. */
+  async function timedOut<T>(pending: () => Promise<T>) {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      const pending = claude.attribute(attribution("2".repeat(64)));
+      const result = pending();
       await vi.advanceTimersByTimeAsync(60_000);
-      await expect(pending).resolves.toBe(UNAPPLIED);
+      return await result;
     } finally {
       vi.useRealTimers();
     }
-    fake.ignoreEnv = false;
-    // Whatever Claude took, the restore is still sent.
+  }
+
+  it("asks again next turn when Claude doesn't report its settings", async () => {
+    const { claude, fake } = await started(ON_GATEWAY);
+    fake.withhold = "get_settings";
+    await expect(
+      timedOut(() => claude.attribute(attribution("1".repeat(64)))),
+    ).resolves.toBe(UNREADABLE);
+    fake.withhold = undefined;
+    await expect(
+      claude.attribute(attribution("2".repeat(64))),
+    ).resolves.toBeUndefined();
+    await claude.send("attributed");
+    expect(fake.headers[0]).toContain(`x-gw-ctx-message-id: ${"2".repeat(64)}`);
+  });
+
+  it("writes again after an unconfirmed change, and restores after", async () => {
+    const { claude, fake } = await started(ON_GATEWAY);
+    await claude.attribute(attribution("1".repeat(64)));
+    fake.withhold = "apply_flag_settings";
+    await expect(
+      timedOut(() => claude.attribute(attribution("1".repeat(64)))),
+    ).resolves.toBeUndefined();
+    await expect(
+      timedOut(() => claude.attribute(attribution("2".repeat(64)))),
+    ).resolves.toBe(UNAPPLIED);
+    fake.withhold = undefined;
+    // The same headers again are still sent, since either may be in effect.
+    await claude.attribute(attribution("2".repeat(64)));
+    await claude.send("second");
     await claude.attribute(undefined);
     await claude.send("restored");
-    expect(fake.headers).toEqual(["x-keep: configured"]);
+    expect(fake.headers[0]).toContain(`x-gw-ctx-message-id: ${"2".repeat(64)}`);
+    expect(fake.headers[1]).toBe("x-keep: configured");
+  });
+
+  it("drops a late answer, which never stands in for a newer change", async () => {
+    const { claude, fake } = await started(ON_GATEWAY);
+    fake.withhold = "apply_flag_settings";
+    await expect(
+      timedOut(() => claude.attribute(attribution("1".repeat(64)))),
+    ).resolves.toBe(UNAPPLIED);
+    fake.withhold = undefined;
+    await claude.attribute(attribution("2".repeat(64)));
+    // Claude takes the stale change late: the next turn still writes its own.
+    fake.answerLate();
+    await claude.attribute(attribution("2".repeat(64)));
+    await claude.send("current");
+    expect(fake.headers[0]).toContain(`x-gw-ctx-message-id: ${"2".repeat(64)}`);
   });
 
   it("reports a refused update without failing the turn", async () => {
     const { claude, fake } = await started(ON_GATEWAY);
     fake.refuseEnv = true;
     await expect(claude.attribute(attribution(null))).resolves.toMatch(
-      /didn't take Buzz's header change/,
+      /didn't confirm Buzz's header change/,
     );
     await expect(claude.send("still runs")).resolves.toMatchObject({
       ok: true,

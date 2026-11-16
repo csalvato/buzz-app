@@ -51,7 +51,7 @@ export type Baseline = Readonly<{
 
 const NOTICE = "Not attributed in the agent gateway";
 export const UNREADABLE = `${NOTICE}: Claude didn't report its settings.`;
-export const UNAPPLIED = `${NOTICE}: Claude didn't take Buzz's header change, so it may still send an earlier turn's Buzz headers.`;
+export const UNAPPLIED = `${NOTICE}: Claude didn't confirm Buzz's header change, so it may send either the earlier or the new headers.`;
 export const PROVIDER = `${NOTICE}: Claude is set to use another provider.`;
 export const ELSEWHERE = `${NOTICE}: Claude's own endpoint isn't the agent gateway.`;
 export const INHERITED = `${NOTICE}: Claude's custom headers come from the app's environment, which Buzz can't read to keep them.`;

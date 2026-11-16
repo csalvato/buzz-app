@@ -604,7 +604,11 @@ export class ClaudeProcess {
       this.inherited(),
     ]).then(([baseline, inherited]) => baseline && { ...baseline, inherited });
     const baseline = await this.baseline;
-    if (!baseline) return attribution && UNREADABLE;
+    // Unread, so Buzz changed nothing: a later turn asks again.
+    if (!baseline) {
+      this.baseline = undefined;
+      return attribution && UNREADABLE;
+    }
     const reason =
       attribution &&
       ineligible(baseline, attribution.origin, await this.provider);
@@ -623,10 +627,17 @@ export class ClaudeProcess {
     if (headers === current) return reason;
     // Only the one env key: Claude merges flag settings key by key, so its
     // endpoint, sign-in, effort and model stay as they are.
-    const answer = await this.attributionCall({
-      subtype: "apply_flag_settings",
-      settings: { env: { ANTHROPIC_CUSTOM_HEADERS: headers } },
-    });
+    // A change Claude takes late may undo a newer one, so its headers are
+    // unknown again and the next change is written whatever it is.
+    const answer = await this.attributionCall(
+      {
+        subtype: "apply_flag_settings",
+        settings: { env: { ANTHROPIC_CUSTOM_HEADERS: headers } },
+      },
+      () => {
+        this.attributed = null;
+      },
+    );
     // Unknown until a later change takes, which a restore then still sends.
     this.attributed = answer.subtype === "success" ? headers : null;
     return answer.subtype === "success" ? reason : UNAPPLIED;
@@ -634,18 +645,30 @@ export class ClaudeProcess {
 
   /** A control call attribution makes, answered as an error when it fails or
    * Claude takes longer than `ATTRIBUTION_CALL_MS`, so it never holds up the
-   * turn or compaction waiting on it. */
-  private attributionCall(request: Message): Promise<Message> {
+   * turn or compaction waiting on it. A late answer is dropped, after
+   * `late` runs. */
+  private attributionCall(
+    request: Message,
+    late?: () => void,
+  ): Promise<Message> {
+    const { id, written, answer } = this.request(request);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<Message>((resolve) => {
-      timer = setTimeout(
-        () => resolve({ subtype: "error", error: "timed out" }),
-        ATTRIBUTION_CALL_MS,
-      );
+    const expired = new Promise<Message>((resolve) => {
+      timer = setTimeout(() => {
+        if (late) this.calls.set(id, late);
+        else this.calls.delete(id);
+        resolve({ subtype: "error", error: "timed out" });
+      }, ATTRIBUTION_CALL_MS);
     });
     return Promise.race([
-      this.call(request).catch(() => ({ subtype: "error" })),
-      late,
+      written.then(
+        () => answer,
+        (): Message => {
+          this.calls.delete(id);
+          return { subtype: "error" };
+        },
+      ),
+      expired,
     ]).finally(() => clearTimeout(timer));
   }
 
@@ -728,7 +751,7 @@ export class ClaudeProcess {
       request_id: id,
       request,
     });
-    return { written, answer };
+    return { id, written, answer };
   }
   /** Sends a control request and resolves with Claude's response. */
   private call(request: Message): Promise<Message> {
