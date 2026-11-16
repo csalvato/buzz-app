@@ -2625,6 +2625,37 @@ it("starts its own turn for a message whose turn the owner stopped while its his
   expect(inputText(f.starts()[1])).toContain("second");
   expect(f.steers()).toHaveLength(0);
 });
+it("leaves the status of a turn that began while a failed one reported its failure", async () => {
+  const f = fixture();
+  await f.runtime.run(f.delivery("first"));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  const answer = deferred<void>();
+  f.held.set("turn/start", answer.promise);
+  await f.runtime.run(f.delivery("second"));
+  await vi.waitFor(() =>
+    expect(f.sent.filter((wire) => wire.method === "turn/start")).toHaveLength(
+      2,
+    ),
+  );
+  const reported = deferred<EventData>();
+  f.publish.mockImplementationOnce(() => reported.promise);
+  f.emit({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "failed", error: { message: "boom" } },
+    },
+  });
+  await vi.waitFor(() => expect(f.publish).toHaveBeenCalledTimes(1));
+  answer.resolve();
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  await vi.waitFor(() =>
+    expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Working"),
+  );
+  reported.resolve({} as EventData);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(f.runtime.sessions(pubkey)[0]?.status).toBe("Working");
+});
 it("leaves the status of a turn that began while an interrupted one ended its shells", async () => {
   const f = fixture();
   await f.runtime.run(f.delivery("first"));

@@ -3300,12 +3300,14 @@ export class CodexRuntime {
         );
         // The denied input may have shaped the provider's reason, so it shows
         // only on the owner's Activity tab, never in the thread agents read.
-        this.status(
-          agent.key,
-          key,
-          "Needs attention",
-          why ? `${reason} Reason: ${why}` : reason,
-        );
+        // A message that began the next turn meanwhile keeps its status.
+        if (!lane.active || lane.active === active)
+          this.status(
+            agent.key,
+            key,
+            "Needs attention",
+            why ? `${reason} Reason: ${why}` : reason,
+          );
       }
     } finally {
       for (const taken of active.requests)
