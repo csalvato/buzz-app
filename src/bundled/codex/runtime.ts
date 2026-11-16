@@ -82,6 +82,34 @@ import {
   type ToolReply,
 } from "./rpc";
 import { findConversation } from "./transcript";
+import {
+  bindingAdmits,
+  bindSession,
+  inferenceBundle,
+  type GatewayBinding,
+  type TurnContext,
+} from "../../features/agents/gateway/contract";
+import {
+  compactRefusal,
+  controlTurn,
+} from "../../features/agents/gateway/forwarding";
+import { fallbackNotice } from "../../features/agents/gateway/route";
+import {
+  CODEX_ROUTES,
+  COMPACT_GATEWAY,
+  COMPACT_ORDINARY,
+  controlRoute,
+  FROM_GATEWAY,
+  gatewayProvider,
+  ROUTE_CHANGED,
+  threadConfig,
+  TO_GATEWAY,
+  UNCERTAIN,
+  type CodexGateway,
+  type CodexRoute,
+  type CodexRoutes,
+  type ProviderConfig,
+} from "./gateway";
 
 type Request = {
   current?: () => boolean;
@@ -122,6 +150,11 @@ type Request = {
   /** Notes plugins left for this turn, taken when its input is first built:
    * one that fails or is cancelled before then leaves them for the next. */
   notes?: readonly string[];
+  /** The membership's gateway route and this delivery's context, frozen at
+   * dispatch; used when Codex's own configuration routes to the gateway. */
+  gateway?: CodexGateway;
+  /** Why a wake ran without the gateway, for its Activity status. */
+  gatewayFallback?: Delivery["gatewayFallback"];
 };
 /** `at` is when the binding last took in a message or ended a turn; bindings
  * saved before it existed have none. `tools` is the `addedKey` of the
@@ -136,6 +169,10 @@ type Saved = {
   /** A lost first-turn response must not be treated as an empty session. */
   pending?: true;
   protection?: string;
+  /** The Buzz session of a thread that ran through the agent gateway;
+   * absent for an ordinary thread. A thread resumes only in the mode it ran
+   * in: Codex keeps a thread on the provider it started with. */
+  gateway?: GatewayBinding;
 };
 type Active = {
   /** The server this turn runs on; steering must reach the same process. */
@@ -159,6 +196,12 @@ type Active = {
   requests: Request[];
   /** Latest acknowledged mention per Buzz thread; independent of session scope. */
   activity: Map<string, Request>;
+  /** A gateway turn's route revision and frozen context: a request steers
+   * into it only with exactly these, so nothing is sent under another
+   * delivery's IDs. */
+  gateway?: string | undefined;
+  /** The turn the thread's `turn/completed` reported, once it has. */
+  completedId?: string;
 };
 /** A watch or timer turn on an ephemeral thread of its own. Its tools have
  * no default destination and it answers no request. */
@@ -200,6 +243,9 @@ type Server = {
   /** Starts a turn of a thread. What it returns takes why the provider refused
    * that turn's model input, if it said. */
   explainer?(threadId: string): () => string | undefined;
+  /** Gateway threads this process left uncertain: a turn whose end wasn't
+   * seen, or a release Codex didn't confirm. None resumes on this process. */
+  uncertain: Set<string>;
 };
 export type SessionView = { key: string; status: string; detail: string };
 /** A saved binding, newest first, for the owner's transcript list, with the
@@ -340,6 +386,7 @@ export class CodexRuntime {
     private readonly protectionHost?: Pick<Host, "spawn" | "serveMcp">,
     private readonly handle: (pubkey: string) => AgentHandle | undefined = () =>
       undefined,
+    private readonly routes: CodexRoutes = CODEX_ROUTES,
   ) {}
   private executionKey(agent: AgentKey, scope: string, conversation: string) {
     return `buzz.codex.sessions.execution.v1:${scope}:${agent}:${conversation}`;
@@ -618,6 +665,11 @@ export class CodexRuntime {
         throw new Error("The protected agent has no live policy binding");
       const thread = resumable(saved, this.handle(agent.key)?.protection);
       if (!thread) throw new Error("There is no session here to compact yet.");
+      // Where a turn would fall back from the gateway, compaction fails
+      // before anything runs, as Claude's does.
+      const control = controlRoute(this.routes, agent.key);
+      if (control?.kind === "blocked")
+        throw new Error(compactRefusal(fallbackNotice(control.route)));
       const server = this.open(this.handle(agent.key));
       const rpc = await server.opening;
       const settings = this.resolveConfig(agent.config);
@@ -626,37 +678,85 @@ export class CodexRuntime {
         throw new Error(
           "The workspace changed. Send a message to start its session first.",
         );
-      const { params, bridge } = await this.prepare(
-        rpc,
-        agent,
-        settings,
-        workspace,
-        {},
-      );
+      const prepared = await this.prepare(rpc, agent, settings, workspace, {});
+      const { bridge } = prepared;
+      let { params } = prepared;
+      // Through the gateway where the agent's turns go, under the control's
+      // own context, and only for a thread that ran there.
+      const gateway = control?.gateway;
+      const headed = this.gatewayParams(prepared, gateway);
+      const routed = headed ? gateway : undefined;
+      if (routed && !thread.gateway) {
+        await bridge?.close();
+        throw new Error(COMPACT_ORDINARY);
+      }
+      if (!routed && thread.gateway) {
+        await bridge?.close();
+        throw new Error(COMPACT_GATEWAY);
+      }
+      if (routed && server.uncertain.has(thread.threadId)) {
+        await bridge?.close();
+        throw new Error(UNCERTAIN);
+      }
+      const routeAbort = new AbortController();
+      const stopped = AbortSignal.any([signal, routeAbort.signal]);
+      let unwatch: (() => void) | undefined;
+      /** Whether compaction ended as Codex reported, or never started. */
+      let ended = true;
+      /** Codex refused a step: nothing started, and it may have let go. */
+      let refused = false;
       try {
-        signal.throwIfAborted();
+        if (routed && headed) {
+          unwatch = this.stayOnRoute(agent.key, routed, (error) =>
+            routeAbort.abort(error),
+          );
+          const bound = bindSession(routed.route, thread.gateway, "resume");
+          if (!bound.ok) throw new Error(bound.message);
+          params = headed(bound.binding, controlTurn(place, settings.scope));
+        }
+        stopped.throwIfAborted();
         bridge?.bind(thread.threadId);
         await rpc.request("thread/resume", {
           ...params,
           threadId: thread.threadId,
           excludeTurns: true,
         });
-        signal.throwIfAborted();
-        await this.compact(rpc, signal, thread.threadId, agent.key, key);
+        stopped.throwIfAborted();
+        ended = false;
+        await this.compact(rpc, stopped, thread.threadId, agent.key, key);
+        ended = true;
         this.status(agent.key, key, "Idle");
       } catch (error) {
+        if (error instanceof Refused) ended = refused = true;
         this.status(
           agent.key,
           key,
-          signal.aborted ? "Interrupted" : "Needs attention",
+          stopped.aborted ? "Interrupted" : "Needs attention",
           message(error),
         );
         throw error;
       } finally {
+        unwatch?.();
         await bridge?.close();
-        await rpc
-          .request("thread/unsubscribe", { threadId: thread.threadId })
+        const released = await rpc
+          .request<{ status?: string }>("thread/unsubscribe", {
+            threadId: thread.threadId,
+          })
           .catch(() => undefined);
+        // As a turn's: only a seen end and a confirmed release let the
+        // thread resume here under other IDs.
+        if (
+          routed &&
+          (!ended ||
+            !(
+              releasedCleanly(released) ||
+              // A refused step released it already, or never subscribed.
+              (refused && released?.status === "notSubscribed")
+            ))
+        ) {
+          server.uncertain.add(thread.threadId);
+          this.status(agent.key, key, "Needs attention", UNCERTAIN);
+        }
       }
     });
   }
@@ -993,6 +1093,7 @@ export class CodexRuntime {
         rpc,
         protection,
         threads: new Map(),
+        uncertain: new Set(),
         opening: Promise.resolve(rpc),
       };
       server.opening = (async () => {
@@ -1074,6 +1175,7 @@ export class CodexRuntime {
         defaults.workspace,
       ),
       threads: new Map(),
+      uncertain: new Set(),
     };
     // An exit fails current work and permits the next ordinary mention to reopen.
     rpc.onMessage((wire) => {
@@ -1450,6 +1552,10 @@ export class CodexRuntime {
         ? { resumed: true }
         : {}),
       ...(solo && delivery.named ? { named: delivery.named } : {}),
+      ...(delivery.gateway ? { gateway: delivery.gateway } : {}),
+      ...(wake && delivery.gatewayFallback
+        ? { gatewayFallback: delivery.gatewayFallback }
+        : {}),
     };
     if (!validWorkspace(settings.workspace)) {
       failActivity(
@@ -1504,7 +1610,11 @@ export class CodexRuntime {
                 request.conversation.topLevel !==
                   active.reply.conversation.topLevel ||
                 (request.model && request.model !== active.model) ||
-                (request.effort && request.effort !== active.effort)
+                (request.effort && request.effort !== active.effort) ||
+                // A gateway turn's requests carry its delivery's context; a
+                // request with any other runs as its own turn.
+                (active.gateway !== undefined &&
+                  gatewayMark(request.gateway) !== active.gateway)
               ) {
                 queue();
                 return;
@@ -1648,7 +1758,14 @@ export class CodexRuntime {
     if (entry.abort.signal.aborted)
       return { ok: false, error: "Codex was stopped" };
     const server = this.open(agent);
-    const signal = AbortSignal.any([entry.abort.signal, turnSignal]);
+    const routeAbort = new AbortController();
+    const signal = AbortSignal.any([
+      entry.abort.signal,
+      turnSignal,
+      routeAbort.signal,
+    ]);
+    const { gatewayFallback } = delivery;
+    let unwatch: (() => void) | undefined;
     let release!: () => void;
     const once: Once = {
       finished: false,
@@ -1669,7 +1786,7 @@ export class CodexRuntime {
       const workspace = await this.workspace(settings.workspace);
       signal.throwIfAborted();
       once.workspace = workspace;
-      const { params, model, effort, summary, bridge } = await this.prepare(
+      const prepared = await this.prepare(
         rpc,
         agent,
         settings,
@@ -1677,7 +1794,21 @@ export class CodexRuntime {
         {},
         delivery.synced,
       );
+      const { model, effort, summary, bridge } = prepared;
+      let { params } = prepared;
       hookBridge = bridge;
+      // Through the gateway when Codex's configuration goes there, in a
+      // Buzz session of its own: the thread is never resumed or saved.
+      const headed = this.gatewayParams(prepared, delivery.gateway);
+      if (headed && delivery.gateway) {
+        const { gateway } = delivery;
+        unwatch = this.stayOnRoute(agent.key, gateway, (error) =>
+          routeAbort.abort(error),
+        );
+        const bound = bindSession(gateway.route, undefined, "standalone");
+        if (!bound.ok) throw new Error(bound.message);
+        params = headed(bound.binding, gateway.turn);
+      }
       const text = await prompt();
       if (text === undefined) return { ok: true };
       const memory = await this.core(agent.key, signal);
@@ -1713,14 +1844,17 @@ export class CodexRuntime {
         },
       );
       once.turnId ??= turnStarted.turn.id;
-      this.status(agent.key, key, "Working");
+      this.status(agent.key, key, "Working", gatewayFallback?.notice);
       const status = await followed.completed;
       if (status === "interrupted") {
-        this.status(agent.key, key, "Interrupted");
+        this.status(agent.key, key, "Interrupted", gatewayFallback?.notice);
         return { ok: false, error: "Codex’s turn was interrupted" };
       }
-      // A finished wake leaves nothing to show; a failed one stays listed.
-      this.forget(agent.key, key);
+      // A finished wake leaves nothing to show; a failed one stays listed,
+      // as does one that ran without the gateway it routes through.
+      if (gatewayFallback)
+        this.status(agent.key, key, "Idle", gatewayFallback.notice);
+      else this.forget(agent.key, key);
       return { ok: true };
     } catch (error) {
       if (!once.finished && once.threadId && once.turnId)
@@ -1733,6 +1867,7 @@ export class CodexRuntime {
       this.status(agent.key, key, "Needs attention", message(error));
       return { ok: false, error: message(error) };
     } finally {
+      unwatch?.();
       await hookBridge?.close();
       once.finished = true;
       followed.stop();
@@ -2210,7 +2345,7 @@ export class CodexRuntime {
     synced?: Delivery["synced"],
   ) {
     const normalized = await rpc.request<{
-      config: {
+      config: ProviderConfig & {
         mcp_servers?: Record<string, Record<string, unknown>>;
         model_reasoning_summary?: string | null;
         features?: { hooks?: boolean; codex_hooks?: boolean };
@@ -2285,7 +2420,53 @@ export class CodexRuntime {
     const summary = normalized.config.model_reasoning_summary
       ? {}
       : { summary: "auto" };
-    return { params, model, effort, summary, bridge };
+    return {
+      params,
+      model,
+      effort,
+      summary,
+      bridge,
+      providers: normalized.config as ProviderConfig,
+    };
+  }
+  /** The thread params for a local gateway turn under `binding`: `params`
+   * with the active provider's header table replaced; undefined when there
+   * is no such turn or provider, and the turn runs as configured. */
+  private gatewayParams<Params extends { config: Record<string, unknown> }>(
+    prepared: Readonly<{ params: Params; providers: ProviderConfig }>,
+    gateway: CodexRoute | undefined,
+  ) {
+    // Only a local agent: Codex elsewhere has its own configuration.
+    const provider =
+      gateway && !this.target && gatewayProvider(prepared.providers);
+    if (!gateway || !provider) return undefined;
+    return (binding: GatewayBinding, turn: TurnContext): Params => {
+      const bundle = inferenceBundle(gateway.route.profile, binding, turn);
+      if (!bundle.ok) throw new Error(bundle.message);
+      return {
+        ...prepared.params,
+        config: {
+          ...prepared.params.config,
+          ...threadConfig(gateway, provider, bundle.value),
+        },
+      };
+    };
+  }
+  /** Watches `gateway`'s route for `agent` from now: `abort` runs once the
+   * route moves past the revision it was dispatched at. */
+  private stayOnRoute(
+    agent: AgentKey,
+    gateway: CodexRoute | undefined,
+    abort: (error: Error) => void,
+  ) {
+    if (!gateway) return undefined;
+    const check = () => {
+      if (this.routes.routeFor(agent).revision !== gateway.route.revision)
+        abort(new Error(ROUTE_CHANGED));
+    };
+    const off = this.routes.subscribeRoute(agent, check);
+    check();
+    return off;
   }
   private async execute(
     request: Request,
@@ -2334,6 +2515,13 @@ export class CodexRuntime {
     });
     let hookBridge: Awaited<ReturnType<typeof openHookBridge>> | undefined;
     let explain: (() => string | undefined) | undefined;
+    /** Set for a turn that runs through the gateway. */
+    let gateway: CodexGateway | undefined;
+    let unwatch: (() => void) | undefined;
+    /** Whether `turn/start` may have reached Codex. */
+    let dispatched = false;
+    /** The mode switch or fallback this turn's Activity status shows. */
+    let notice = request.gatewayFallback?.notice;
     try {
       const rpc = await server.opening;
       signal.throwIfAborted();
@@ -2343,8 +2531,8 @@ export class CodexRuntime {
       signal.throwIfAborted();
       active.workspace = workspace;
       const saved = entry.saved[key];
-      const existing = resumable(saved, agent.protection);
-      const { params, model, effort, summary, bridge } = await this.prepare(
+      const kept = resumable(saved, agent.protection);
+      const prepared = await this.prepare(
         rpc,
         agent,
         settings,
@@ -2352,7 +2540,26 @@ export class CodexRuntime {
         request,
         request.synced,
       );
+      const { model, effort, summary, bridge } = prepared;
+      let { params } = prepared;
       hookBridge = bridge;
+      // Through the gateway only when Codex's own configuration goes there.
+      const headed = this.gatewayParams(prepared, request.gateway);
+      if (headed) gateway = request.gateway;
+      active.gateway = gatewayMark(gateway);
+      // It stays on the revision it was routed at; a change stops it.
+      unwatch = this.stayOnRoute(agent.key, gateway, (error) =>
+        turnAbort.abort(error),
+      );
+      signal.throwIfAborted();
+      // A thread resumes only in the mode it ran in. The other mode starts
+      // a new thread, and says so.
+      const switched = kept !== undefined && !kept.gateway !== !gateway;
+      const existing = switched ? undefined : kept;
+      if (switched) {
+        notice = gateway ? TO_GATEWAY : FROM_GATEWAY;
+        this.status(agent.key, key, "Starting", notice);
+      }
       active.model = model;
       active.effort = effort;
       // Resume restores the thread's tools, so one started with other added
@@ -2361,6 +2568,20 @@ export class CodexRuntime {
       const tools = addedKey(added);
       const resuming =
         existing?.workspace === workspace && (existing.tools ?? "") === tools;
+      if (gateway && resuming && server.uncertain.has(existing.threadId))
+        throw new Error(UNCERTAIN);
+      /** The Buzz session a gateway thread runs under. */
+      let binding: GatewayBinding | undefined;
+      // The whole table replaces the provider's headers on every start and
+      // resume: a resumed thread otherwise keeps its earlier ones.
+      const bind = (event: "resume" | "new_generation") => {
+        if (!gateway || !headed) return;
+        const bound = bindSession(gateway.route, existing?.gateway, event);
+        if (!bound.ok) throw new Error(bound.message);
+        binding = bound.binding;
+        params = headed(binding, gateway.turn);
+      };
+      bind(resuming ? "resume" : "new_generation");
       type Started = { thread: { id: string; cwd: string } };
       const start = () =>
         rpc.request<Started>("thread/start", {
@@ -2407,6 +2628,8 @@ export class CodexRuntime {
           .catch(async (error) => {
             missing(error);
             fresh = true;
+            // A lost thread is a new Buzz session.
+            bind("new_generation");
             return start();
           });
       } else started = await start();
@@ -2448,6 +2671,16 @@ export class CodexRuntime {
         memory,
         this.repositories(request.scope),
       );
+      // Dispatched only at the revision it was routed at, by a binding the
+      // route still admits.
+      if (gateway && binding) {
+        const admitted = bindingAdmits(
+          this.routes.routeFor(agent.key),
+          binding,
+        );
+        if (!admitted.ok || admitted.revision !== gateway.route.revision)
+          throw new Error(ROUTE_CHANGED);
+      }
       if (this.target && !resuming)
         await this.save(request, entry, key, {
           pending: true,
@@ -2456,11 +2689,15 @@ export class CodexRuntime {
           at: Date.now(),
           ...(tools ? { tools } : {}),
         });
+      const note = [switched ? notice : undefined, noteOf(request)]
+        .filter(Boolean)
+        .join("\n\n");
+      dispatched = true;
       const turn = await rpc
         .request<{ turn: { id: string } }>("turn/start", {
           threadId: active.threadId,
           input: input(
-            `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, false, noteOf(request), wake, this.reads(request.agent.key)?.authorNames?.(request.event.pubkey))}`,
+            `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, false, note || undefined, wake, this.reads(request.agent.key)?.authorNames?.(request.event.pubkey))}`,
           ),
           model,
           effort,
@@ -2469,6 +2706,8 @@ export class CodexRuntime {
           additionalContext,
         })
         .catch(async (error: unknown) => {
+          // Refused, it never started.
+          if (error instanceof Refused) dispatched = false;
           if (this.target && !resuming && error instanceof Refused) {
             const { [key]: _, ...saved } = entry.saved;
             await this.storage.set(entry.storageKey, JSON.stringify(saved));
@@ -2516,6 +2755,7 @@ export class CodexRuntime {
         at: Date.now(),
         ...(tools ? { tools } : {}),
         ...(agent.protection ? { protection: agent.protection.stateKey } : {}),
+        ...(binding ? { gateway: binding } : {}),
       });
       ready();
       this.status(agent.key, key, "Working");
@@ -2525,7 +2765,7 @@ export class CodexRuntime {
       if (status === "interrupted" && active.stopped) {
         for (const taken of active.requests) taken.answered(true);
         await this.terminals(rpc, active.threadId, STOP_LINGER_MS);
-        this.status(agent.key, key, "Stopped");
+        this.status(agent.key, key, "Stopped", notice);
       } else if (status === "interrupted") {
         for (const taken of active.requests)
           taken.failActivity("Codex’s turn was interrupted");
@@ -2542,7 +2782,7 @@ export class CodexRuntime {
         if (failed instanceof Error) throw failed;
         // A turn may end without a reply when there is nothing new to say.
         for (const taken of active.requests) taken.answered();
-        this.status(agent.key, key, "Idle");
+        this.status(agent.key, key, "Idle", notice);
       }
     } catch (error) {
       // Refused before any turn began, it took nothing in.
@@ -2581,8 +2821,17 @@ export class CodexRuntime {
         );
       }
     } finally {
+      unwatch?.();
       for (const taken of active.requests)
         taken.failActivity("Codex ended without a final reply");
+      // A gateway turn that may have run must be seen to end before its
+      // thread is released: a resume while it runs keeps its headers.
+      const ended =
+        !gateway ||
+        !dispatched ||
+        (active.turnId !== undefined &&
+          (await completion(server.rpc, active, COMPLETION_GRACE_MS)) &&
+          active.completedId === active.turnId);
       followed.stop();
       // A turn Codex took in has ended, however it ended.
       if (active.turnId && !entry.abort.signal.aborted)
@@ -2590,10 +2839,23 @@ export class CodexRuntime {
       turnAbort.abort(new Error("The Codex turn has ended"));
       // Release the subscription before the next resume: loaded-thread rejoin
       // ignores instruction/config overrides while a client is subscribed.
-      if (active.threadId)
-        await server.rpc
-          .request("thread/unsubscribe", { threadId: active.threadId })
-          .catch(() => server.rpc.close());
+      if (active.threadId) {
+        const released = await server.rpc
+          .request<{ status?: string }>("thread/unsubscribe", {
+            threadId: active.threadId,
+          })
+          .catch(() => {
+            void server.rpc.close();
+            return undefined;
+          });
+        // Only a confirmed release after a seen end lets the thread resume
+        // here under other IDs; anything else leaves it unavailable.
+        if (gateway && (!ended || !releasedCleanly(released))) {
+          server.uncertain.add(active.threadId);
+          if (!entry.abort.signal.aborted)
+            this.status(agent.key, key, "Needs attention", UNCERTAIN);
+        }
+      }
       await hookBridge?.close();
       if (lane.active === active) delete lane.active;
     }
@@ -2613,7 +2875,12 @@ type Item = {
 function follow(
   rpc: AppServer,
   signal: AbortSignal,
-  turn: { threadId?: string; turnId?: string; finished: boolean },
+  turn: {
+    threadId?: string;
+    turnId?: string;
+    finished: boolean;
+    completedId?: string;
+  },
   onItem?: (method: string, item: Item) => void,
 ) {
   let finish!: (status: string) => void;
@@ -2643,6 +2910,7 @@ function follow(
     if (p.item && wire.method) onItem?.(wire.method, p.item);
     if (wire.method === "turn/completed" && p.turn) {
       turn.finished = true;
+      turn.completedId = p.turn.id;
       if (p.turn.status === "failed")
         fail(new Error(p.turn.error?.message ?? "Codex turn failed"));
       else finish(p.turn.status);
@@ -2673,6 +2941,38 @@ const dynamicTools = (added: readonly AddedTool[]) => [
   },
 ];
 const EMPTY: readonly SessionView[] = Object.freeze([]);
+/** A gateway delivery's route revision and turn context, which a steered
+ * request must share with its turn. */
+const gatewayMark = (gateway: CodexGateway | undefined) =>
+  gateway && JSON.stringify([gateway.route.revision, gateway.turn]);
+/** How long a gateway turn's end is awaited after it failed or was stopped,
+ * before its thread is left uncertain. */
+const COMPLETION_GRACE_MS = 10_000;
+/** Whether a release confirmed the thread let go: `unsubscribed`, or
+ * `notLoaded` from a process that already unloaded it. */
+const releasedCleanly = (released: { status?: string } | undefined) =>
+  released?.status === "unsubscribed" || released?.status === "notLoaded";
+/** Whether `turn` is seen to complete on `rpc` within `ms` (`follow` marks
+ * it): at once when it already has; false once the connection closes. */
+function completion(
+  rpc: AppServer,
+  turn: { finished: boolean },
+  ms: number,
+): Promise<boolean> {
+  if (turn.finished) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const done = (seen: boolean) => {
+      clearTimeout(timer);
+      off();
+      resolve(seen);
+    };
+    const timer = setTimeout(() => done(turn.finished), ms);
+    const off = rpc.onMessage((wire) => {
+      if (wire.method === "connection/closed") done(false);
+      else if (turn.finished) done(true);
+    });
+  });
+}
 
 /** A started Codex item as a step, named in the shared step vocabulary.
  * Shapes follow codex app-server v2 `ThreadItem` / `CommandAction` (camelCase). */
