@@ -496,9 +496,10 @@ function MessageRowContent({
   const timeReply = shown.diff
     ? undefined
     : parseMediaTimeReply(row.forward?.note ?? shown.content);
-  const sourceRow = timeReply
-    ? { ...shown, content: timeReply.content }
-    : shown;
+  const sourceRow =
+    timeReply && !row.forward
+      ? { ...shown, content: timeReply.content }
+      : shown;
   const { caption: displayRow, cards: chatCards } = useMemo(
     () => separateChatCards(sourceRow, directory.channels),
     [sourceRow, directory.channels],
