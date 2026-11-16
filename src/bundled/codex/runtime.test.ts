@@ -2546,6 +2546,33 @@ it("sends a message whose history read outlasts the running turn as a turn/start
     f.publish.mock.calls.map(([event]) => (event as EventData).content),
   ).toEqual(["FIRST", "SECOND"]);
 });
+it("starts its own turn for a message whose turn the owner stopped while its history was read", async () => {
+  const f = fixture();
+  const interruptible = vi.fn<NonNullable<Delivery["interruptible"]>>();
+  await f.runtime.run({ ...f.delivery("first"), interruptible });
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  const gate = deferred<EventData[]>();
+  f.read.mockImplementationOnce(() => gate.promise);
+  await f.runtime.run(f.delivery("second"));
+  await vi.waitFor(() => expect(f.read).toHaveBeenCalledTimes(2));
+  const accepted = deferred<void>();
+  f.held.set("turn/interrupt", accepted.promise);
+  const stopped = interruptible.mock.calls[0]?.[0]?.();
+  await vi.waitFor(() =>
+    expect(f.sent.some((wire) => wire.method === "turn/interrupt")).toBe(true),
+  );
+  gate.resolve([]);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(f.steers()).toHaveLength(0);
+  accepted.resolve();
+  await stopped;
+  // It waits out the stopped turn's search for its shells.
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2), {
+    timeout: 3_000,
+  });
+  expect(inputText(f.starts()[1])).toContain("second");
+  expect(f.steers()).toHaveLength(0);
+});
 it("dates a binding by the latest message it took in or turn it ended", async () => {
   let now = 1_000;
   vi.spyOn(Date, "now").mockImplementation(() => now);

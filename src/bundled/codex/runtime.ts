@@ -3000,6 +3000,14 @@ export class CodexRuntime {
     );
     let joined = false;
     let explain: (() => string | undefined) | undefined;
+    /** Waits for the running turn to end, and runs as the next one. */
+    const alone = async () => {
+      if (!base) return;
+      await base.released;
+      base = undefined;
+      lane.active = active;
+      delete lane.starting;
+    };
     try {
       const rpc = await server.opening;
       signal.throwIfAborted();
@@ -3029,12 +3037,7 @@ export class CodexRuntime {
         else {
           // What a thread opened with cannot change under a running turn: this
           // message waits for it, then reopens the thread.
-          if (base) {
-            await base.released;
-            base = undefined;
-            lane.active = active;
-            delete lane.starting;
-          }
+          await alone();
           signal.throwIfAborted();
           await this.drop(entry, key);
           loaded = await this.openThread(
@@ -3078,6 +3081,12 @@ export class CodexRuntime {
           text: (await request.wakeText?.()) ?? request.wake.text,
         };
         signal.throwIfAborted();
+        // A turn the owner stopped, or that ended, takes nothing more; its
+        // cleanup ends before the next turn starts.
+        if (base?.stopped || base?.finished) {
+          await alone();
+          signal.throwIfAborted();
+        }
         if (request.current && !request.current()) {
           restoreNotes(request);
           request.answered();
