@@ -28,11 +28,6 @@ import { readUsage } from "./usage";
 export const TYPE_ID = "goose";
 /** The harness goose declares to the gateway, its descriptor upstream key. */
 export const HARNESS = "goose";
-/** Whether goose declares its harness to the gateway, which forwards its
- * agents' turns where their membership routes through it. Off until a pinned
- * goose has run forwarded turns end to end. */
-const GATEWAY = false;
-
 export const inject = ["agents", "host", "agentProtection"];
 export const apply: PluginModule["apply"] = (ctx) => {
   // Only the desktop app can start `goose-acp`; no unusable type elsewhere.
@@ -53,7 +48,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     recommended,
     // Without a goose upstream in this build, the runner sends every turn
     // without the gateway, so nothing forwards.
-    GATEWAY && ctx.pluginOwner && upstreamFor(HARNESS)
+    ctx.pluginOwner && upstreamFor(HARNESS)
       ? new GatewayForwarding(
           ctx.pluginOwner,
           { upstream: HARNESS, native: "goose" },
@@ -139,7 +134,9 @@ export const apply: PluginModule["apply"] = (ctx) => {
 
   agents.register<Config>({
     id: TYPE_ID,
-    ...(GATEWAY ? { gateway: { harness: HARNESS } } : {}),
+    // Declares its harness to the gateway, which forwards its agents' turns
+    // where their membership routes through it.
+    gateway: { harness: HARNESS },
     retire: (pubkey) => runtime.retire(pubkey),
     protection: true,
     title: "Goose",
