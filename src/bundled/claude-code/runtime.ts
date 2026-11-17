@@ -87,7 +87,7 @@ import {
   localSessions,
   Spare,
 } from "./sessions";
-import { PROTECTED, refused } from "./attribution";
+import { PROTECTED, REMOTE, refused } from "./attribution";
 import {
   bindSession,
   inferenceBundle,
@@ -1421,6 +1421,12 @@ export class ClaudeRuntime {
     noted: (notice: string) => void,
   ): Attribute {
     return async (process, saved) => {
+      // Remote Claude is outside this rollout: its settings are never read
+      // or changed, and only a gateway turn says so.
+      if (this.target) {
+        if (gateway) noted(REMOTE);
+        return undefined;
+      }
       // Its pinned launch reads none of the person's settings, so no gateway.
       if (gateway && this.agents.get(agent)?.protected) {
         noted(PROTECTED);
