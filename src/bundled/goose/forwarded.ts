@@ -98,31 +98,17 @@ export async function forwardedTurn(
   let outcome: Settled;
   try {
     halt.signal.throwIfAborted();
-    starting = turn.start(
-      {
-        DATABRICKS_HOST: generation.url,
-        // goose 1.57.0 sends even loopback requests to an inherited proxy
-        // unless these name it; both, as either may be read.
-        NO_PROXY: generation.noProxy,
-        no_proxy: generation.noProxy,
-        // Its one prompt is the turn's: no model call names the session.
-        GOOSE_DISABLE_SESSION_NAMING: "true",
-        // A delegate runs on these, not a provider the model or config names
-        // (goose 1.57.0 `resolve_provider_config`); a recipe's own still wins.
-        ...subagent(turn),
-      },
-      (goose) => {
-        process = goose;
-        exited = false;
-        exit = goose.exited.then(() => {
-          exited = true;
-        });
-        // Ended while it starts, or before: it is stopped at once. Once
-        // started, it is retired in order instead.
-        if (halt.signal.aborted) void goose.kill();
-        else halt.signal.addEventListener("abort", kill, { once: true });
-      },
-    );
+    starting = turn.start(forwardedEnv(generation, turn), (goose) => {
+      process = goose;
+      exited = false;
+      exit = goose.exited.then(() => {
+        exited = true;
+      });
+      // Ended while it starts, or before: it is stopped at once. Once
+      // started, it is retired in order instead.
+      if (halt.signal.aborted) void goose.kill();
+      else halt.signal.addEventListener("abort", kill, { once: true });
+    });
     // Never abandoned: retirement waits for whatever it started.
     void starting.catch(() => undefined);
     const goose = await abortable(starting, halt.signal).finally(() =>
@@ -215,6 +201,36 @@ export async function forwardedTurn(
 
 const noop = () => {};
 
+/** The bearer every forwarded goose sends: a fixed value, not a secret.
+ * goose's Databricks provider needs one to send anything; without one it
+ * tries OAuth discovery, which never reaches the gateway. Set in the
+ * process's own environment, it is the one goose reads first (goose 1.59.2
+ * `Config::get_secret`), ahead of a token the app's environment passes on
+ * or the owner's goose keeps in its keyring or `secrets.yaml`. So no
+ * Databricks token of theirs reaches the gateway. Delegates run in the same
+ * process on the same provider, so they send it too. */
+export const GATEWAY_TOKEN = "buzz-agent-gateway-placeholder";
+
+/** A forwarded goose's environment on `generation`. */
+export function forwardedEnv(
+  generation: Pick<Generation, "url" | "noProxy">,
+  turn: Pick<ForwardedTurn, "model" | "choice">,
+): Record<string, string> {
+  return {
+    DATABRICKS_HOST: generation.url,
+    DATABRICKS_TOKEN: GATEWAY_TOKEN,
+    // goose 1.57.0 sends even loopback requests to an inherited proxy
+    // unless these name it; both, as either may be read.
+    NO_PROXY: generation.noProxy,
+    no_proxy: generation.noProxy,
+    // Its one prompt is the turn's: no model call names the session.
+    GOOSE_DISABLE_SESSION_NAMING: "true",
+    // A delegate runs on these, not a provider the model or config names
+    // (goose 1.57.0 `resolve_provider_config`); a recipe's own still wins.
+    ...subagent(turn),
+  };
+}
+
 /** The provider goose forwards through: the gateway serves Databricks'
  * API. */
 export const GATEWAY_PROVIDER = "databricks";
@@ -222,7 +238,9 @@ export const GATEWAY_PROVIDER = "databricks";
 /** Pins a delegate to the gateway's provider, which a forwarded turn runs on
  * whether the agent names it or inherits goose's default, and to the turn's
  * model when it names one. */
-function subagent(turn: ForwardedTurn): Record<string, string> {
+function subagent(
+  turn: Pick<ForwardedTurn, "model" | "choice">,
+): Record<string, string> {
   const chosen = turn.model || turn.choice().model;
   return {
     GOOSE_SUBAGENT_PROVIDER: GATEWAY_PROVIDER,

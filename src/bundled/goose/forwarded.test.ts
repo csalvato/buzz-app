@@ -7,7 +7,9 @@ import {
 import type { ForwardChildRegistered } from "../../features/host/forward";
 import {
   type ForwardedTurn,
+  forwardedEnv,
   forwardedTurn,
+  GATEWAY_TOKEN,
   NOT_CLOSED,
   NOT_KEPT,
   NOT_STOPPED,
@@ -136,6 +138,8 @@ describe("a forwarded goose turn", () => {
     expect(fake.geese).toHaveLength(1);
     expect(goose?.env).toMatchObject({
       DATABRICKS_HOST: "http://127.0.0.1:4100/g1",
+      // The fixed bearer, never a token of the owner's.
+      DATABRICKS_TOKEN: GATEWAY_TOKEN,
       NO_PROXY: "corp.example,127.0.0.1,localhost",
       no_proxy: "corp.example,127.0.0.1,localhost",
       GOOSE_DISABLE_SESSION_NAMING: "true",
@@ -182,6 +186,28 @@ describe("a forwarded goose turn", () => {
       generation(undefined, undefined, false),
     );
     await expect(run()).resolves.toEqual({ ok: false, error: NOT_KEPT });
+  });
+
+  it("gives every forwarded goose the same fixed, nonsecret bearer", async () => {
+    const { fake, run } = setup();
+    await expect(run()).resolves.toMatchObject({ ok: true });
+    await expect(run({ model: "m-turn" })).resolves.toMatchObject({ ok: true });
+    expect(fake.geese.map((goose) => goose.env.DATABRICKS_TOKEN)).toEqual([
+      GATEWAY_TOKEN,
+      GATEWAY_TOKEN,
+    ]);
+    // Set beside the generation, it is what the process's environment
+    // holds whatever the app's own carries.
+    expect(
+      forwardedEnv(
+        { url: "http://127.0.0.1:4100/g9", noProxy: "127.0.0.1,localhost" },
+        { choice: () => ({ provider: "databricks", model: "" }) },
+      ),
+    ).toMatchObject({
+      DATABRICKS_HOST: "http://127.0.0.1:4100/g9",
+      DATABRICKS_TOKEN: GATEWAY_TOKEN,
+    });
+    expect(GATEWAY_TOKEN).toBe("buzz-agent-gateway-placeholder");
   });
 
   it("pins a delegate's model to the turn's, else the agent's", async () => {
