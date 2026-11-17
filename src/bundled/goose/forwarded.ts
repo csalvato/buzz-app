@@ -44,6 +44,8 @@ export type ForwardedTurn = Readonly<{
   /** The conversation (or one-off label) its Buzz tools act for. */
   conversation: string;
   title?: string;
+  /** Keys goose indexes a new session by, so its conversation finds it. */
+  tags?: Readonly<Record<string, string>>;
   /** The saved session to resume; it never falls back to a new one. */
   load?: string;
   /** The turn's text once its session is open, `fresh` for a new session
@@ -134,9 +136,10 @@ export async function forwardedTurn(
         tools: turn.tools,
         choice: turn.choice,
         ...(turn.load === undefined
-          ? turn.title
-            ? { title: turn.title }
-            : {}
+          ? {
+              ...(turn.title ? { title: turn.title } : {}),
+              ...(turn.tags ? { tags: turn.tags } : {}),
+            }
           : { load: turn.load }),
         onSession: (opened) => {
           session = opened;

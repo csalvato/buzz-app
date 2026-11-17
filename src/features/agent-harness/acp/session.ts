@@ -45,6 +45,9 @@ export class AcpSession {
   observe:
     | ((update: Record<string, unknown>, prompting: boolean) => void)
     | undefined;
+  /** Run before each new turn is sent, one at a time: brings the session's
+   * system prompt up to date. */
+  beforeTurn: (() => Promise<void>) | undefined;
   /** The harness's id for the running turn, which a steer must name. */
   private runId: string | undefined;
   /** Steers waiting for the running turn's id, which the harness sends just
@@ -97,6 +100,10 @@ export class AcpSession {
   private acted = false;
   private written = "";
   private closed = false;
+  /** A final message ended the work: the id of its tool call, whose result
+   * cancels the running turn once the harness reports it, then `true` until
+   * that turn ends. Meanwhile the turn takes no steers. */
+  private ending: string | true | undefined;
   /** The work the owner stopped, while the harness ends it: the messages it
    * had taken, and their activity. What it wrote meanwhile is not posted, and
    * messages sent since wait for a turn of their own. `ended` is set once
@@ -105,6 +112,10 @@ export class AcpSession {
     | { waiters: Waiter[]; receipts: Set<ActivityReceipt>; ended?: true }
     | undefined;
   private idlers: (() => void)[] = [];
+  /** How often its work has been stopped or has ended. */
+  private generation = 0;
+  /** Cancellation belongs to this burst of work, never the next one. */
+  private work: AbortController | undefined;
 
   constructor(
     private readonly acp: AcpProcess,
@@ -133,8 +144,7 @@ export class AcpSession {
     return this.chosen.effort ?? "";
   }
   /** Resolves once nothing runs, waits to run or waits for its answer:
-   * unlike `busy`, it waits out the model call the harness makes after a final
-   * `send` too. */
+   * unlike `busy`, it waits out the end of the turn after a final `send` too. */
   idle(): Promise<void> {
     if (this.quiet()) return Promise.resolve();
     return new Promise((resolve) => this.idlers.push(resolve));
@@ -153,6 +163,7 @@ export class AcpSession {
   ): Promise<Settled> {
     if (this.closed)
       return Promise.resolve({ ok: false, error: "The session was closed" });
+    if (this.quiet()) this.work = new AbortController();
     this.pending++;
     let waiter!: Waiter;
     const settled = new Promise<Settled>((resolve) => {
@@ -164,6 +175,7 @@ export class AcpSession {
     if (
       this.prompting &&
       !this.stopped &&
+      !this.ending &&
       this.acp.hooks.steering &&
       !this.queue.length &&
       (!model || model === this.model) &&
@@ -187,12 +199,32 @@ export class AcpSession {
     return settled;
   }
 
-  /** A final message succeeded: the work counts as done at once, unless
-   * another message is still waiting for its answer. The harness may still end
-   * its turn with one more model call, whose text nobody posts. */
-  finished() {
-    if (this.pending === 1 && !this.queue.length && !this.steering.size)
-      this.settle({ ok: true });
+  /** Whether the work running now, if any, still runs unstopped and
+   * unfinished when asked later; work after it is not that work. */
+  current(): () => boolean {
+    const generation = this.stopped || this.quiet() ? -1 : this.generation;
+    return () =>
+      this.generation === generation && !this.stopped && !this.quiet();
+  }
+
+  /** The exact work's cancellation, already aborted before any work starts. */
+  get signal(): AbortSignal {
+    return (
+      this.work?.signal ?? AbortSignal.abort(new Error("The turn has ended"))
+    );
+  }
+
+  private abortWork() {
+    this.work?.abort(new Error("The turn has ended"));
+  }
+
+  /** A final message succeeded: the work counts as done at once, and the
+   * turn of tool call `call` ends, unless another message is still waiting
+   * for its answer. */
+  finished(call?: string) {
+    if (this.pending !== 1 || this.queue.length || this.steering.size) return;
+    this.settle({ ok: true, answered: true });
+    if (this.prompting && call) this.ending = call;
   }
 
   /** Stops the work: the running turn, as ACP's `session/cancel` does, and
@@ -201,6 +233,8 @@ export class AcpSession {
    * harness ends it; a message sent before it has runs as a new turn after. */
   interrupt() {
     if (!this.working || this.closed) return;
+    this.generation++;
+    this.abortWork();
     this.queue.length = 0;
     this.steered = Promise.resolve();
     this.stopped = {
@@ -226,6 +260,18 @@ export class AcpSession {
       );
     }
     const kind = update.sessionUpdate;
+    // A cancel before goose has the final message's result would save that
+    // call as interrupted. goose reports a batch's results together, once
+    // every call in it has one, and keeps them when the turn is cancelled.
+    if (
+      typeof this.ending === "string" &&
+      kind === "tool_call_update" &&
+      update.toolCallId === this.ending &&
+      (update.status === "completed" || update.status === "failed")
+    ) {
+      this.ending = true;
+      this.acp.notify("session/cancel", { sessionId: this.id });
+    }
     if (kind === "agent_message_chunk" && !this.acted) {
       const content = update.content as { text?: unknown } | undefined;
       if (typeof content?.text === "string")
@@ -367,8 +413,11 @@ export class AcpSession {
     this.prompting = true;
     try {
       while (this.queue.length && !this.handingOff && !this.closed) {
+        this.ending = undefined;
         // Stopped work has ended, and messages sent since run as new work.
         if (this.stopped) this.endStopped();
+        if (!this.work || this.work.signal.aborted)
+          this.work = new AbortController();
         const {
           text,
           model,
@@ -383,6 +432,7 @@ export class AcpSession {
         };
         let sent = false;
         try {
+          await this.beforeTurn?.();
           await this.select(model, effort);
           // A harness may ignore a level its model lacks, and keep one across
           // a model switch without its being set again.
@@ -438,6 +488,7 @@ export class AcpSession {
       }
     } finally {
       this.prompting = false;
+      this.ending = undefined;
       this.runId = undefined;
       this.ranAs(undefined);
     }
@@ -517,6 +568,7 @@ export class AcpSession {
     this.settle({
       ...(failure?.error ? { ok: false, ...failure } : { ok: true }),
       ...(text ? { text } : {}),
+      ...(this.acted ? { answered: true } : {}),
       ...(!failure?.error && this.stopped?.ended ? { stopped: true } : {}),
     });
   }
@@ -556,6 +608,7 @@ export class AcpSession {
       );
   }
   private settle(settled: Settled) {
+    this.abortWork();
     this.pending = 0;
     this.active.clear();
     this.displaced.clear();
@@ -583,6 +636,9 @@ export class AcpSession {
     );
   }
   private wake() {
-    if (this.quiet()) for (const resolve of this.idlers.splice(0)) resolve();
+    if (!this.quiet()) return;
+    this.abortWork();
+    this.generation++;
+    for (const resolve of this.idlers.splice(0)) resolve();
   }
 }

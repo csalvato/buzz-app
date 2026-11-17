@@ -23,15 +23,25 @@ export type FakeClaude = {
   model: string;
   /** The model each user message was taken on. */
   models: string[];
-  /** Its effective settings env, which `get_settings` reports and
-   * `apply_flag_settings` merges over key by key. */
+  /** Its user settings file's env, which a test may rewrite as a running
+   * Claude reloads it. */
   env: Record<string, string>;
+  /** Its flag layer's env, which `apply_flag_settings` replaces whole. */
+  flagEnv: Record<string, string> | undefined;
+  /** A managed policy's env, which outranks the flag layer. */
+  policyEnv?: Record<string, string>;
+  /** The env in effect: user, then flag, then policy. */
+  effective(): Record<string, string>;
   /** The custom headers each user message was taken with. */
   headers: (string | undefined)[];
   /** When set, an `apply_flag_settings` that sets env is refused. */
   refuseEnv?: boolean;
-  /** Control requests of this subtype go unanswered until `answerLate()`. */
-  withhold?: string | undefined;
+  /** Control requests of this subtype, or that this picks, go unanswered
+   * until `answerLate()`. */
+  withhold?:
+    | string
+    | ((request: Record<string, unknown>) => boolean)
+    | undefined;
   /** Takes the withheld control requests, as a late Claude would. */
   answerLate(): void;
   /** The `account.apiProvider` its `initialize` answer reports. */
@@ -43,6 +53,8 @@ export type FakeClaude = {
   interruptError?: string;
   /** When false, a kill is only a request; the test calls `exit()`. */
   exitOnKill: boolean;
+  /** The agents its Buzz credential was asked to act as, in order. */
+  actedAs: Readonly<{ pubkey: string; relay: string }>[];
   emit(message: Record<string, unknown>): void;
   finish(result?: Readonly<{ error?: string }>): void;
   exit(code: number | null, stderr?: string): void;
@@ -75,6 +87,18 @@ export const CLAUDES: ReadonlySet<string> = new Set([
   "claude-protected-arm64",
 ]);
 
+/** `claude auth status --json` where the person has no Claude setup of
+ * their own, as Claude answers it: its JSON, then exit 1. */
+export function signedOut(options: HostProcessOptions = {}): HostProcess {
+  options.onStdout?.('{"loggedIn": false, "authMethod": "none"}\n');
+  return {
+    write: async () => {},
+    end: async () => {},
+    kill: async () => {},
+    exited: Promise.resolve(1),
+  };
+}
+
 /** A spawn whose Claude processes answer like Claude, on an Apple silicon
  * Mac. Sessions named in `known` (or created by a process) can be resumed;
  * others fail to load. Each starts with `env` as its settings' env and
@@ -103,6 +127,9 @@ export function fakeSpawn(
         exited: Promise.resolve(fails ? 1 : 0),
       };
     }
+    // No setup of the person's own: Claude runs with Buzz's key.
+    if (CLAUDES.has(id) && options.args?.[0] === "auth")
+      return signedOut(options);
     let resolveExit!: (code: number | null) => void;
     const exited = new Promise<number | null>((resolve) => {
       resolveExit = resolve;
@@ -127,12 +154,15 @@ export function fakeSpawn(
       model: flag("--model") ?? "default",
       models: [],
       env: { ...env },
+      flagEnv: undefined,
+      effective: () => ({ ...fake.env, ...fake.flagEnv, ...fake.policyEnv }),
       apiProvider,
       headers: [],
       hold: false,
       killed: false,
       exitOnKill: true,
       answerLate: () => {},
+      actedAs: [],
       emit(message) {
         if (alive) options.onStdout?.(`${JSON.stringify(message)}\n`);
       },
@@ -163,6 +193,7 @@ export function fakeSpawn(
       },
     };
     const withheld: Record<string, unknown>[] = [];
+    let sent: string | undefined;
     fake.answerLate = () => {
       const withhold = fake.withhold;
       fake.withhold = undefined;
@@ -174,7 +205,12 @@ export function fakeSpawn(
       fake.received.push(message);
       if (message.type === "control_request") {
         const request = message.request as Record<string, unknown>;
-        if (request.subtype === fake.withhold) {
+        const { withhold } = fake;
+        if (
+          typeof withhold === "function"
+            ? withhold(request)
+            : request.subtype === withhold
+        ) {
           withheld.push(message);
           return;
         }
@@ -206,7 +242,7 @@ export function fakeSpawn(
             });
             return;
           }
-          Object.assign(fake.env, env);
+          fake.flagEnv = { ...env };
         }
         if (request.subtype === "interrupt" && fake.interruptError) {
           fake.emit({
@@ -231,7 +267,26 @@ export function fakeSpawn(
                       effort: fake.effort,
                       model: resolved(fake.model),
                     },
-                    effective: { env: { ...fake.env } },
+                    effective: { env: fake.effective() },
+                    sources: [
+                      { source: "userSettings", settings: { env: fake.env } },
+                      ...(fake.flagEnv
+                        ? [
+                            {
+                              source: "flagSettings",
+                              settings: { env: fake.flagEnv },
+                            },
+                          ]
+                        : []),
+                      ...(fake.policyEnv
+                        ? [
+                            {
+                              source: "policySettings",
+                              settings: { env: fake.policyEnv },
+                            },
+                          ]
+                        : []),
+                    ],
                   },
                 }
               : {}),
@@ -256,7 +311,9 @@ export function fakeSpawn(
       fake.prompts.push(content);
       fake.efforts.push(fake.effort);
       fake.models.push(fake.model);
-      fake.headers.push(fake.env.ANTHROPIC_CUSTOM_HEADERS);
+      // As Claude does, a value no settings set any more stays in its env.
+      sent = fake.effective().ANTHROPIC_CUSTOM_HEADERS ?? sent;
+      fake.headers.push(sent);
       if (!started) {
         started = true;
         known.add(session);
@@ -288,6 +345,11 @@ export function fakeSpawn(
         fake.killed = true;
         if (fake.exitOnKill) fake.exit(null);
       },
+      ...(options.agentCredential && {
+        actAs: async (agent: Readonly<{ pubkey: string; relay: string }>) => {
+          fake.actedAs.push(agent);
+        },
+      }),
       exited,
     };
     // Output that arrives before spawn returns is buffered by the caller.

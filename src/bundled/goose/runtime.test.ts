@@ -1,4 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AddedTool } from "../../buzz-mcp/session-tools";
+import {
+  type RecommendedRun,
+  recommendedRun,
+} from "../../features/agents/recommended";
 import type { BuzzClient, Memories } from "../../buzz-mcp/client";
 import { callTool, memoryVersion } from "../../buzz-mcp/tools";
 import { createAgentMemories } from "../../features/agents/memory";
@@ -14,11 +19,13 @@ import type { Agent, Delivery } from "../../features/agents/service";
 import type { AgentProtection } from "../../features/agent-protection/service";
 import type { Host } from "../../features/host/service";
 import type { EventData, RelayEvent } from "../../features/relay/events";
+import { eventDto } from "../../features/relay/events";
+import { keypair, signed } from "../../features/relay/testing";
 import type { RelayData } from "../../features/relay/service";
 import { fakeSpawn, flush, gated } from "./goose-testing";
 import { REQUEST_TIMEOUT_MS } from "./goose";
 import { AcpSession } from "../../features/agent-harness/acp/session";
-import { AgentSessions, localSessions, SharedProcess } from "./sessions";
+import { AgentProcess, AgentSessions, localSessions } from "./sessions";
 import { gooseTurns, marked, unmarked } from "./transcript";
 import { SHARED_POOL } from "../../features/agent-harness/acp/agent-sessions";
 import {
@@ -34,9 +41,11 @@ import type { ForwardOpen } from "../../features/host/forward";
 import {
   DEFAULT_CONFIG,
   GooseRuntime,
+  running,
   sessionTitle,
   standalonePrompt,
 } from "./runtime";
+import { explainTurn } from "./setup";
 
 describe("sessionTitle", () => {
   it("names the agent, the channel and a thread's root", () => {
@@ -80,6 +89,7 @@ function setup(
   options: Readonly<{
     /** Channels that are the owner's own Solo chats; the owner is the viewer. */
     solo?: Set<string>;
+    added?: readonly AddedTool[];
     hold?: boolean;
     reply?: string;
     thread?: readonly EventData[];
@@ -97,12 +107,16 @@ function setup(
       slug?: string,
     ) => Promise<Memories>;
     thinking?: NonNullable<Parameters<typeof fakeSpawn>[0]>["thinking"];
+    /** The community's relay workflow key. */
+    workflowAuthority?: string;
     /** Wraps the fake's `spawn`, as `gated(…).wrap` does. */
     wrap?: (spawn: ReturnType<typeof fakeSpawn>["spawn"]) => Host["spawn"];
     forwarding?: GatewayForwarding;
     provider?: string;
     /** goose's own default provider. */
     defaultProvider?: () => Promise<string | undefined>;
+    /** What agents on Recommended run on. */
+    recommended?: RecommendedRun;
   }> = {},
 ) {
   const fake = fakeSpawn({
@@ -151,6 +165,7 @@ function setup(
     dispose: () => {},
   };
   const session = {
+    workflowAuthority: options.workflowAuthority,
     read,
     agentMemories: {
       open: vi.fn(() => memories),
@@ -210,9 +225,10 @@ function setup(
     () => relay,
     core,
     storage,
-    undefined,
+    () => options.added ?? [],
     options.repositories,
     localStore(storage),
+    options.recommended,
     options.forwarding,
     options.defaultProvider,
   );
@@ -288,6 +304,9 @@ it("reads a protected Goose file under containment and reviews the captured text
     key: "policy",
     stateKey: "revision",
     assertAvailable() {},
+    checkEvidence: async () => {
+      throw new Error("Unexpected streamed check in this fixture");
+    },
     check,
     processProtection: {
       readOnlyPaths: ["/controls"],
@@ -340,6 +359,9 @@ it("leaves a protected Buzz tool call to Goose's own tool review", async () => {
     key: "policy",
     stateKey: "revision",
     assertAvailable() {},
+    checkEvidence: async () => {
+      throw new Error("Unexpected streamed check in this fixture");
+    },
     check,
     processProtection: { readOnlyPaths: [], hiddenPaths: [] },
     spawn: (options) => f.fake.spawn("goose", options),
@@ -370,6 +392,9 @@ const protection = (key: string, f: () => ReturnType<typeof setup>) =>
     stateKey: "revision",
     processProtection: { readOnlyPaths: [], hiddenPaths: [] },
     assertAvailable: () => {},
+    checkEvidence: async () => {
+      throw new Error("Unexpected streamed check in this fixture");
+    },
     check: async () => {},
     spawn: (options) => f().fake.spawn("goose", options),
   }) satisfies AgentProtection;
@@ -546,7 +571,7 @@ it("reports the retirement's own failure when stopping the worker fails too", as
     vi.spyOn(AgentSessions.prototype, "shutdown").mockRejectedValueOnce(
       new Error("stuck"),
     );
-    vi.spyOn(SharedProcess.prototype, "shutdown").mockRejectedValueOnce(
+    vi.spyOn(AgentProcess.prototype, "shutdown").mockRejectedValueOnce(
       new Error("worker"),
     );
     await expect(f.runtime.retire(f.agent.key)).rejects.toThrow("stuck");
@@ -556,7 +581,7 @@ it("reports the retirement's own failure when stopping the worker fails too", as
   }
 });
 
-it("keeps an ordinary agent stopped after a failed retirement, and repeats it until its sessions close", async () => {
+it("keeps an ordinary agent stopped after a failed retirement, with its own goose stopped, until a retirement succeeds", async () => {
   vi.spyOn(console, "warn").mockImplementation(() => undefined);
   const held = gated("session/close", () => true);
   const f = setup({ wrap: held.wrap });
@@ -575,12 +600,9 @@ it("keeps an ordinary agent stopped after a failed retirement, and repeats it un
     );
     expect(f.fake.geese).toHaveLength(1);
     expect(f.fake.geese[0]?.opened).toHaveLength(1);
-    // The close that failed stays failed while goose runs.
-    await expect(f.runtime.retire(f.agent.key)).rejects.toThrow(
-      "No active run",
-    );
-    f.fake.geese[0]?.exit(null);
-    await flush(30);
+    // Its goose is its own, so the failed retirement stopped it too, and
+    // the next retirement has no unclosed session left.
+    expect(f.fake.geese[0]?.killed).toBe(true);
     await f.runtime.retire(f.agent.key);
     await f.deliver(message("3", "Third"));
     await vi.waitFor(() => expect(f.fake.geese[1]?.turns).toHaveLength(1));
@@ -643,7 +665,7 @@ it("drops a delivery queued while its agent retires, without posting that goose 
   }
 });
 
-it("stops the shared Goose only once the last agent's retirement has closed its sessions", async () => {
+it("stops an agent's Goose only once its retirement has closed its sessions", async () => {
   const held = gated("session/close");
   const f = setup({ wrap: held.wrap });
   try {
@@ -670,6 +692,9 @@ it("stops a protected tool's native session read that Goose does not answer in t
   const check = vi.fn<AgentProtection["check"]>().mockResolvedValue();
   const protectedAgent: AgentProtection = {
     ...protection("policy-1", () => f),
+    checkEvidence: async () => {
+      throw new Error("Unexpected streamed check in this fixture");
+    },
     check,
     spawn: (options) => held.wrap(f.fake.spawn)("goose", options),
   };
@@ -724,6 +749,9 @@ it.each(["retire", "dispose"] as const)(
       processProtection: { readOnlyPaths: [], hiddenPaths: [] },
       assertAvailable: () => {},
       spawn: (options) => f.fake.spawn("goose", options),
+      checkEvidence: async () => {
+        throw new Error("Unexpected streamed check in this fixture");
+      },
       check: async (action, signal) => {
         if (action.kind !== "tool") return;
         expect(action.content).toMatchObject({
@@ -872,6 +900,258 @@ describe("GooseRuntime", () => {
     expect(process?.cancelled).toEqual([process?.turns[0]?.sessionId]);
   });
 
+  it("lists added tools and cancels a held write across Stop without reviving it in the next turn", async () => {
+    let signal: AbortSignal | undefined;
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const write = vi.fn();
+    const tool: AddedTool = {
+      name: "fixture_save",
+      description: "Fixture write",
+      inputSchema: { type: "object" },
+      call: async (client) => {
+        signal = client.signal;
+        if (!signal) throw new Error("Cancellation required");
+        signal.throwIfAborted();
+        enter();
+        await held;
+        signal.throwIfAborted();
+        write();
+        return "saved";
+      },
+    };
+    const f = setup({ hold: true, scope: "channel", added: [tool] });
+    const interruptible = vi.fn<NonNullable<Delivery["interruptible"]>>();
+    await f.deliver(message("1", "save"), { interruptible });
+    await vi.waitFor(() => expect(f.goose()?.turns).toHaveLength(1));
+    const process = f.goose();
+    const sessionId = process?.turns[0]?.sessionId;
+    if (!process || !sessionId) throw new Error("Turn missing");
+    expect(await process.mcp(sessionId, "tools/list")).toMatchObject({
+      result: {
+        tools: expect.arrayContaining([
+          expect.objectContaining({ name: tool.name }),
+        ]),
+      },
+    });
+    const pending = process.mcp(sessionId, "tools/call", {
+      name: tool.name,
+      arguments: {},
+    });
+    try {
+      await entered;
+      expect(signal?.aborted).toBe(false);
+      await interruptible.mock.calls[0]?.[0]();
+      expect(signal?.aborted).toBe(true);
+      await f.deliver(message("2", "next"));
+      await vi.waitFor(() => expect(process.turns).toHaveLength(2));
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      release();
+    }
+    expect(await pending).toMatchObject({ result: { isError: true } });
+    expect(write).not.toHaveBeenCalled();
+    const old = signal;
+    expect(
+      await process.mcp(sessionId, "tools/call", {
+        name: tool.name,
+        arguments: {},
+      }),
+    ).not.toMatchObject({ result: { isError: true } });
+    expect(signal).not.toBe(old);
+    expect(signal?.aborted).toBe(false);
+    expect(write).toHaveBeenCalledTimes(1);
+    process.turns[1]?.finish();
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+    expect(
+      await process.mcp(sessionId, "tools/call", {
+        name: tool.name,
+        arguments: {},
+      }),
+    ).toMatchObject({ result: { isError: true } });
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps steered work live, then cancels its plugin calls on a successful final send or retirement", async () => {
+    const signals: AbortSignal[] = [];
+    const f = setup({
+      hold: true,
+      scope: "channel",
+      added: [
+        {
+          name: "fixture_signal",
+          description: "Capture cancellation",
+          inputSchema: { type: "object" },
+          call: async (client) => {
+            if (!client.signal) throw new Error("Cancellation required");
+            client.signal.throwIfAborted();
+            signals.push(client.signal);
+            return "live";
+          },
+        },
+      ],
+    });
+    try {
+      await f.deliver(message("1", "first"));
+      await vi.waitFor(() => expect(f.goose()?.turns).toHaveLength(1));
+      const process = f.goose();
+      const id = process?.turns[0]?.sessionId;
+      if (!process || !id) throw new Error("Missing turn");
+      const capture = () =>
+        process.mcp(id, "tools/call", { name: "fixture_signal" });
+      await capture();
+      await f.deliver(message("2", "steer"));
+      await vi.waitFor(() => expect(process.turns[0]?.steered).toHaveLength(1));
+      expect(signals[0]?.aborted).toBe(false);
+      expect(
+        await process.mcp(id, "tools/call", {
+          name: "send",
+          arguments: { text: "Finished", audience: "everyone", final: true },
+          _meta: { "agent-tool-call-request-id": "final-call" },
+        }),
+      ).not.toMatchObject({ result: { isError: true } });
+      // A burst with steered messages is not finished by a single final send.
+      expect(signals[0]?.aborted).toBe(false);
+      process.turns[0]?.finish();
+      await vi.waitFor(() => expect(signals[0]?.aborted).toBe(true));
+      await f.deliver(message("3", "new work"));
+      await vi.waitFor(() => expect(process.turns).toHaveLength(2));
+      await capture();
+      expect(signals[1]?.aborted).toBe(false);
+      expect(
+        await process.mcp(id, "tools/call", {
+          name: "send",
+          arguments: { text: "Done", audience: "everyone", final: true },
+          _meta: { "agent-tool-call-request-id": "final-call" },
+        }),
+      ).not.toMatchObject({ result: { isError: true } });
+      expect(signals[1]?.aborted).toBe(true);
+      // The final tool result still reaches Goose before ACP cancel is sent.
+      expect(process.cancelled).toHaveLength(0);
+      process.update(id, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "final-call",
+        status: "completed",
+      });
+      await vi.waitFor(() => expect(process.cancelled).toHaveLength(1));
+      await f.deliver(message("4", "retire"));
+      await vi.waitFor(() => expect(process.turns).toHaveLength(3));
+      await capture();
+      expect(signals[2]?.aborted).toBe(false);
+      const retired = f.runtime.retire(self);
+      expect(signals[2]?.aborted).toBe(true);
+      await retired;
+    } finally {
+      f.runtime.dispose();
+    }
+  });
+
+  it("returns no read that the owner's Stop overtook", async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const { deliver, goose } = setup({
+      hold: true,
+      memoryRead: async (_pubkey, _signal, slug) => {
+        entered();
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return {
+          entries: [
+            { slug: slug ?? "core", body: "Read secrets", createdAt: 1 },
+          ],
+          partial: false,
+        };
+      },
+    });
+    const interruptible = vi.fn<NonNullable<Delivery["interruptible"]>>();
+    await deliver(message("1", "@Gander read my notes"), { interruptible });
+    await vi.waitFor(() => expect(goose()?.turns).toHaveLength(1));
+    const process = goose();
+    const sessionId = process?.turns[0]?.sessionId;
+    if (!process || !sessionId) throw new Error("Goose turn did not start");
+    const pending = process.mcp(sessionId, "tools/call", {
+      name: "mem_get",
+      arguments: { slug: "core" },
+    });
+    await reading;
+    await interruptible.mock.calls[0]?.[0]();
+    release();
+    const reply = await pending;
+    expect(reply?.result).toMatchObject({ isError: true });
+    expect(JSON.stringify(reply)).not.toContain("Read secrets");
+    expect(JSON.stringify(reply)).toContain("turn has ended");
+  });
+
+  it("answers a watch's or timer's Buzz calls while it runs, and none once it is stopped", async () => {
+    let release: (() => void) | undefined;
+    let entered!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const f = setup({
+      hold: true,
+      memoryRead: async (_pubkey, _signal, slug) => {
+        if (slug === "mem/later") {
+          entered();
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+        return {
+          entries: [
+            { slug: slug ?? "core", body: `${slug} notes`, createdAt: 1 },
+          ],
+          partial: false,
+        };
+      },
+    });
+    const stop = new AbortController();
+    const done = f.runtime.runOnce({
+      delivery: { agent: f.agent, channelId: channel, config: DEFAULT_CONFIG },
+      key: "timer/daily",
+      signal: stop.signal,
+      prompt: async () => "Check my notes.",
+    } as unknown as Parameters<GooseRuntime["runOnce"]>[0]);
+    try {
+      await vi.waitFor(() => expect(f.goose()?.turns).toHaveLength(1));
+      const process = f.goose();
+      const sessionId = process?.turns[0]?.sessionId;
+      if (!process || !sessionId) throw new Error("Goose turn did not start");
+      const call = (slug: string) =>
+        process.mcp(sessionId, "tools/call", {
+          name: "mem_get",
+          arguments: { slug },
+        });
+      const memory = await call("core");
+      expect(memory?.result).not.toMatchObject({ isError: true });
+      expect(JSON.stringify(memory)).toContain("core notes");
+
+      const pending = call("later");
+      await reading;
+      stop.abort(new Error("stopped"));
+      await done;
+      release?.();
+      const refused = await pending;
+      expect(refused?.result).toMatchObject({ isError: true });
+      expect(JSON.stringify(refused)).not.toContain("later notes");
+      expect(JSON.stringify(refused)).toContain("turn has ended");
+    } finally {
+      release?.();
+      stop.abort();
+      await done;
+    }
+  });
+
   it("posts nothing goose wrote without `send`", async () => {
     // Text the agent writes outside `send` is narration, not a reply.
     for (const reply of ["I've replied to Will.", "Plain answer"]) {
@@ -954,6 +1234,23 @@ describe("GooseRuntime", () => {
     expect(memoryOpen).not.toHaveBeenCalled();
   });
 
+  it("ends a turn's prompt with its conversation's instructions", async () => {
+    const { agent, deliver, goose } = setup();
+    const conversationInstructions = vi.fn(() => ({
+      plugin: "acme.tasks",
+      text: "Review only.",
+    }));
+    Object.assign(agent, { conversationInstructions });
+    const mention = message("1", "@Gander hi");
+    await deliver(mention);
+    await vi.waitFor(() => expect(goose()?.turns).toHaveLength(1));
+    expect(goose()?.turns[0]?.text).toMatch(
+      /<owner-instructions source="acme\.tasks">\n[\s\S]*\n\nReview only\.\n<\/owner-instructions>/,
+    );
+    // Keyed as its notes are: the mention's thread session.
+    expect(conversationInstructions).toHaveBeenCalledWith(channel, mention.id);
+  });
+
   it("leaves a Solo chat's session for goose to name, and offers that name", async () => {
     const solo = setup({ hold: true, solo: new Set([channel]) });
     const named = vi.fn();
@@ -974,6 +1271,11 @@ describe("GooseRuntime", () => {
     await flush(100);
     expect(team.goose()?.opened[0]?._meta).toMatchObject({
       sessionTitle: "Buzz agent · #general · 11111111",
+      // goose finds the conversation's sessions by these.
+      tags: {
+        "buzz.agent": self,
+        "buzz.conversation": `${channel}/${"1".repeat(64)}`,
+      },
     });
   });
 
@@ -985,6 +1287,10 @@ describe("GooseRuntime", () => {
     expect(goose()?.turns.map((turn) => turn.text)).toEqual([
       standalonePrompt(self, "Post the daily summary."),
     ]);
+    // Tagged as the agent's alone: it belongs to no conversation.
+    expect(goose()?.opened[0]?._meta).toMatchObject({
+      tags: { "buzz.agent": self },
+    });
   });
 
   it("switches a saved provider in the live session without restarting goose", async () => {
@@ -1047,6 +1353,86 @@ describe("GooseRuntime", () => {
       ]);
     },
   );
+
+  describe("on Recommended", () => {
+    // Synthetic candidates, best first, both for goose.
+    const candidates = ["model-a", "model-b"].map((model) => ({
+      harness: "goose",
+      provider: "openai",
+      model,
+      effort: "max",
+      label: model,
+    }));
+    beforeEach(() =>
+      vi.stubEnv("VITE_BUZZ_RECOMMENDED_AGENT", JSON.stringify(candidates)),
+    );
+    afterEach(() => vi.unstubAllEnvs());
+    const onIt = { ...DEFAULT_CONFIG, preset: "recommended" };
+
+    it("runs on the first candidate still offered, found once per launch", async () => {
+      const offered = vi.fn(async ({ model }: { model: string }) => {
+        return model === "model-b";
+      });
+      const { deliver, fake } = setup({
+        recommended: recommendedRun("goose", offered),
+      });
+      const first = message("1", "@Gander hi");
+      await deliver(first, { config: onIt });
+      await flush(100);
+      expect(fake.geese[0]?.opened[0]?._meta).toMatchObject({
+        provider: "openai",
+      });
+      expect(fake.geese[0]?.configured).toEqual([
+        "session-1 model=model-b",
+        "session-1 thinking_effort=max",
+      ]);
+      await deliver(
+        message("2", "@Gander again", {
+          tags: [
+            ["h", channel],
+            ["e", first.id, "", "reply"],
+            ["p", self],
+          ],
+        }),
+        { config: onIt },
+      );
+      await flush(100);
+      // Model A was not offered; neither is asked about again.
+      expect(offered.mock.calls.map(([{ model }]) => model)).toEqual([
+        "model-a",
+        "model-b",
+      ]);
+    });
+
+    it("looks for nothing for a delivery it drops", async () => {
+      const offered = vi.fn(async () => true);
+      const { run } = setup({ recommended: recommendedRun("goose", offered) });
+      const ignored = vi.fn();
+      // A watch without an address comes as a standalone turn, so is dropped.
+      await run({ type: "watch" } as unknown as Delivery["trigger"], {
+        config: onIt,
+        ignored,
+      });
+      expect(ignored).toHaveBeenCalledOnce();
+      expect(offered).not.toHaveBeenCalled();
+    });
+
+    it("runs on goose's own default when no candidate is offered or the check fails", async () => {
+      const offered = vi.fn(async ({ model }: { model: string }) => {
+        if (model === "model-a") throw new Error("discovery failed");
+        return false;
+      });
+      const { deliver, fake } = setup({
+        recommended: recommendedRun("goose", offered),
+      });
+      await deliver(message("1", "@Gander hi"), { config: onIt });
+      await flush(100);
+      expect(offered).toHaveBeenCalledTimes(2);
+      expect(fake.geese[0]?.turns).toHaveLength(1);
+      expect(fake.geese[0]?.opened[0]?._meta).not.toHaveProperty("provider");
+      expect(fake.geese[0]?.configured).toEqual([]);
+    });
+  });
 
   it("runs a mention on the agent's thinking level", async () => {
     const { deliver, fake } = setup();
@@ -1150,7 +1536,7 @@ describe("GooseRuntime", () => {
     expect(fake.geese[0]?.turns.map((turn) => turn.text)).toHaveLength(1);
   });
 
-  it("keeps goose while another agent runs, and stops it with the last", async () => {
+  it("runs each agent in its own goose, which stops once that agent goes", async () => {
     const { agent, deliver, fake, runtime } = setup();
     const other = {
       ...agent,
@@ -1167,12 +1553,12 @@ describe("GooseRuntime", () => {
     running(agent, other);
     await deliver(message("1", "@Gander hi"));
     await flush(100);
-    running(other);
-    await flush(30);
     const [goose] = fake.geese;
-    expect(goose?.closed).toEqual(["session-1"]);
     expect(goose?.killed).toBe(false);
-    running();
+    // Its credential, in its own process, acts as this agent only.
+    expect(goose?.options.agentCredential).toBe(true);
+    expect(goose?.actedAs?.pubkey).toBe(agent.pubkey);
+    running(other);
     await flush(30);
     expect(goose?.killed).toBe(true);
     expect(fake.geese).toHaveLength(1);
@@ -1396,6 +1782,108 @@ it("reports a failed wake at its thread's root, never at the wake's own id", asy
   for (const event of f.published.filter(({ kind }) => kind === 9))
     expect(event.tags).toContainEqual(["e", root, "", "reply"]);
   expect(JSON.stringify(f.published)).not.toContain(WAKE_ID);
+});
+
+const GOOSE_SETTINGS =
+  "buzz://settings?section=agents&provider=buzz.goose%2Fgoose";
+const REFUSED = `⚠️ I couldn't finish that: Goose's provider rejected its API key or sign-in. Head to [Settings](${GOOSE_SETTINGS}) to check its provider.`;
+/** ACP's refusal for credentials, as goose 1.57 sends it. */
+const AUTH_REQUIRED = {
+  code: -32000,
+  message: "Authentication required",
+  data: { reason: "turn_failed" },
+};
+
+type FakeSpawn = ReturnType<typeof fakeSpawn>["spawn"];
+/** A goose that answers each `method` request with `error`. */
+const failing =
+  (
+    method: string,
+    error: Readonly<{ code: number; message: string; data?: unknown }>,
+  ) =>
+  (spawn: FakeSpawn) =>
+  async (id: string, options: NonNullable<Parameters<FakeSpawn>[1]> = {}) => {
+    const process = await spawn(id, options);
+    return {
+      ...process,
+      write: async (data: string) => {
+        if (id !== "goose" || !data.includes(`"method":"${method}"`))
+          return process.write(data);
+        options.onStdout?.(
+          `${JSON.stringify({ jsonrpc: "2.0", id: JSON.parse(data).id, error })}\n`,
+        );
+      },
+    };
+  };
+
+// As goose 1.57 fails a turn.
+it.each([
+  [
+    "lacks its provider's key, linking Goose's Settings and quoting goose",
+    "session/prompt",
+    {
+      code: -32603,
+      message: "Internal error",
+      data: "Error getting agent reply: Configuration value not found: ANTHROPIC_API_KEY",
+    },
+    `⚠️ I couldn't finish that: Goose is missing an API key (ANTHROPIC_API_KEY). Head to [Settings](${GOOSE_SETTINGS}) to add it.\n\ngoose said:\n> Internal error: Error getting agent reply: Configuration value not found: ANTHROPIC_API_KEY`,
+  ],
+  [
+    "had its key refused, linking Goose's Settings and quoting goose",
+    "session/prompt",
+    AUTH_REQUIRED,
+    `${REFUSED}\n\ngoose said:\n> Authentication required`,
+  ],
+  [
+    "had its key refused opening the session, linking Goose's Settings and quoting goose",
+    "session/new",
+    AUTH_REQUIRED,
+    `${REFUSED}\n\ngoose said:\n> goose could not start: Authentication required`,
+  ],
+  [
+    "failed otherwise, in goose's words",
+    "session/prompt",
+    {
+      code: -32603,
+      message: "Internal error",
+      data: "Error getting agent reply: Request failed: connection refused",
+    },
+    "⚠️ I couldn't finish that: Internal error: Error getting agent reply: Request failed: connection refused",
+  ],
+])("reports a turn whose goose %s", async (_, method, error, content) => {
+  const f = setup({ wrap: failing(method, error) });
+  f.runtime.explain = (failure) => explainTurn(failure, GOOSE_SETTINGS);
+  try {
+    await f.deliver(message("1", "@Gander hi"));
+    await vi.waitFor(() =>
+      expect(f.published.map((post) => post.content)).toEqual([content]),
+    );
+  } finally {
+    f.runtime.dispose();
+  }
+});
+
+it("gives the workflow reason for its owner's workflow mention that doesn't name it", async () => {
+  const relay = keypair();
+  const f = setup({ workflowAuthority: relay.pubkey });
+  const ignored = vi.fn();
+  await f.deliver(
+    eventDto(
+      signed(relay, {
+        kind: 9,
+        content: "@Agent workflow",
+        tags: [
+          ["h", channel],
+          ["p", self],
+          ["buzz:workflow", "true"],
+          ["buzz:workflow-owner", alice],
+        ],
+      }),
+    ),
+    { ignored },
+  );
+  expect(ignored).toHaveBeenCalledExactlyOnceWith("workflow");
+  expect(f.goose()).toBeUndefined();
 });
 
 it("takes a wake with no thread only in a Solo chat", async () => {
@@ -2415,6 +2903,46 @@ describe("goose turns through the agent gateway", () => {
   const root = message("1", "Howzit");
   const key = `${channel}/${root.id}`;
 
+  it("answers a forwarded turn's Buzz tool calls while it runs, and not after", async () => {
+    const write = vi.fn();
+    const tool: AddedTool = {
+      name: "fixture_save",
+      description: "Fixture write",
+      inputSchema: { type: "object" },
+      // A relay read checks that the call's turn is still running.
+      call: async (client) => {
+        await client.query([{ kinds: [1], limit: 1 }]);
+        write();
+        return "saved";
+      },
+    };
+    const g = gateway();
+    const f = setup({
+      forwarding: g.forwarding,
+      provider: "databricks",
+      hold: true,
+      added: [tool],
+    });
+    try {
+      await f.deliver(root, dispatched());
+      await vi.waitFor(() => expect(f.fake.geese[0]?.turns).toHaveLength(1));
+      const goose = f.fake.geese[0];
+      const sessionId = goose?.turns[0]?.sessionId;
+      if (!goose || !sessionId) throw new Error("Forwarded turn missing");
+      const call = () =>
+        goose.mcp(sessionId, "tools/call", { name: tool.name, arguments: {} });
+      expect(await call()).not.toMatchObject({ result: { isError: true } });
+      expect(write).toHaveBeenCalledTimes(1);
+      goose.turns[0]?.finish();
+      await vi.waitFor(() => expect(g.calls).toContain("close 1"));
+      // Its goose and Buzz tools' server are gone with it.
+      await expect(call()).rejects.toThrow("No Buzz MCP server");
+      expect(write).toHaveBeenCalledTimes(1);
+    } finally {
+      f.runtime.dispose();
+    }
+  });
+
   it("runs each turn in a goose of its own on its generation, resuming the session and binding it saved", async () => {
     const g = gateway();
     const f = setup({ forwarding: g.forwarding, provider: "databricks" });
@@ -2443,6 +2971,10 @@ describe("goose turns through the agent gateway", () => {
       expect(first?.env.DATABRICKS_HOST).toBe("http://127.0.0.1:9/g1");
       expect(second?.env.DATABRICKS_HOST).toBe("http://127.0.0.1:9/g2");
       expect(first?.turns).toHaveLength(1);
+      // Tagged as an ordinary session is, so its conversation finds it.
+      expect(first?.opened[0]?._meta).toMatchObject({
+        tags: { "buzz.conversation": key },
+      });
       expect(second?.loaded).toEqual(["session-1"]);
       expect(second?.opened).toEqual([]);
       expect(second?.turns).toHaveLength(1);
@@ -3098,4 +3630,24 @@ describe("goose turns through the agent gateway", () => {
       f.runtime.dispose();
     }
   });
+});
+
+it("runs an agent on Recommended on the current candidate", () => {
+  // A synthetic candidate.
+  const candidate = {
+    harness: "goose",
+    provider: "databricks",
+    model: "goose-model-b",
+    effort: "high",
+    label: "Model B",
+  };
+  const saved = { ...DEFAULT_CONFIG, preset: "recommended" };
+  expect(running(saved, candidate)).toMatchObject({
+    provider: "databricks",
+    model: "goose-model-b",
+    effort: "high",
+  });
+  // With none offered it runs on goose's own default.
+  expect(running(saved, null)).toEqual(saved);
+  expect(running(DEFAULT_CONFIG, candidate)).toEqual(DEFAULT_CONFIG);
 });

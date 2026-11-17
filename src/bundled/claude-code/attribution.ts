@@ -37,13 +37,35 @@ export type Attribution = Readonly<{
   headers: GatewayHeaders;
 }>;
 
-/** What a process's own settings say, read before Buzz changes any. */
-export type Baseline = Readonly<{
-  /** Its own custom headers, as Claude's newline-separated text. */
+/** Claude's settings sources, lowest precedence first (Claude Code's
+ * documented order: managed policy, command line, local, project, user).
+ * Buzz's apply writes the flag layer; nothing else launches with one. */
+const SOURCES = [
+  "userSettings",
+  "projectSettings",
+  "localSettings",
+  "flagSettings",
+  "policySettings",
+] as const;
+const FLAG = "flagSettings";
+const POLICY = "policySettings";
+/** The one flag env key Buzz writes. */
+export const HEADERS = "ANTHROPIC_CUSTOM_HEADERS";
+
+/** What a process's settings say now, read at each new turn. */
+export type Settings = Readonly<{
+  /** The person's own custom headers: the highest source but Buzz's flag
+   * layer (and a policy) that sets them, as Claude's newline-separated text. */
   headers: string | undefined;
   endpoint: string | undefined;
   /** It selects a provider other than Anthropic's API. */
   provider: boolean;
+  /** A managed policy sets custom headers, which outrank Buzz's. */
+  policy: boolean;
+  /** The flag layer's env holds any key, or any but Buzz's one. Replacing
+   * it drops every other key, so Buzz writes it only when it holds none
+   * before Buzz's first write, and none but Buzz's after. */
+  flag: Readonly<{ any: boolean; others: boolean }>;
   /** Claude's inherited env sets custom headers, which its settings don't
    * report; undefined when that couldn't be checked. */
   inherited?: boolean | undefined;
@@ -52,62 +74,88 @@ export type Baseline = Readonly<{
 const NOTICE = "Not attributed in the agent gateway";
 export const UNREADABLE = `${NOTICE}: Claude didn't report its settings.`;
 export const UNAPPLIED = `${NOTICE}: Claude didn't confirm Buzz's header change, so it may send either the earlier or the new headers.`;
+export const STALE = `${NOTICE}: Claude didn't report its settings, so it may still send Buzz's earlier headers.`;
+export const MASKED = `${NOTICE}: Buzz removed its headers, but until the next turn Claude keeps its current custom headers even if its settings change.`;
+export const SHARED = `${NOTICE}: another flag setting now shares Claude's env with Buzz's headers, so Buzz left them rather than erase it.`;
 export const PROVIDER = `${NOTICE}: Claude is set to use another provider.`;
 export const ELSEWHERE = `${NOTICE}: Claude's own endpoint isn't the agent gateway.`;
+export const POLICY_HEADERS = `${NOTICE}: a managed Claude policy sets its custom headers.`;
+export const FOREIGN = `${NOTICE}: something other than Buzz set Claude's flag settings env, which Buzz's headers would replace.`;
 export const INHERITED = `${NOTICE}: Claude's custom headers come from the app's environment, which Buzz can't read to keep them.`;
 export const PROTECTED = `${NOTICE}: protected Claude agents keep their own pinned launch.`;
 /** A shared-contract refusal (binding or context) as this turn's notice. */
 export const refused = (message: string) => `${NOTICE}: ${message}`;
 
-/** The effective env from Claude's `get_settings` answer; undefined when it
- * failed or isn't shaped as expected. */
-export function readBaseline(answer: unknown): Baseline | undefined {
+/** Claude's `get_settings` answer, read by source; undefined when it failed,
+ * isn't shaped as expected or names a source whose rank isn't known. */
+export function readSettings(answer: unknown): Settings | undefined {
   const response = field(answer, "response");
-  const effective = field(response, "effective");
-  if (field(answer, "subtype") !== "success" || !record(effective)) return;
-  const env = field(effective, "env");
-  const text = (name: string) => {
+  const effective = field(field(response, "effective"), "env") ?? {};
+  const sources = field(response, "sources");
+  if (field(answer, "subtype") !== "success" || !Array.isArray(sources)) return;
+  const envs = new Map<string, Record<string, unknown>>();
+  for (const entry of sources) {
+    const name = String(field(entry, "source"));
+    const settings = field(entry, "settings");
+    const env = field(settings, "env") ?? {};
+    const known = (SOURCES as readonly string[]).includes(name);
+    if (!known || envs.has(name) || !record(settings) || !record(env)) return;
+    envs.set(name, env);
+  }
+  if (!record(effective)) return;
+  const text = (env: unknown, name: string) => {
     const value = field(env, name);
     return typeof value === "string" ? value : undefined;
   };
+  const own = SOURCES.filter((name) => name !== FLAG && name !== POLICY)
+    .map((name) => text(envs.get(name), HEADERS))
+    .filter((value) => value !== undefined);
   return {
-    headers: text("ANTHROPIC_CUSTOM_HEADERS"),
-    endpoint: text("ANTHROPIC_BASE_URL"),
+    headers: own.at(-1),
+    endpoint: text(effective, "ANTHROPIC_BASE_URL"),
     provider: PROVIDERS.some((name) =>
-      ON.has((text(name) ?? "").trim().toLowerCase()),
+      ON.has((text(effective, name) ?? "").trim().toLowerCase()),
     ),
+    policy: text(envs.get(POLICY), HEADERS) !== undefined,
+    flag: {
+      any: Object.keys(envs.get(FLAG) ?? {}).length > 0,
+      others: Object.keys(envs.get(FLAG) ?? {}).some(
+        (name) => name !== HEADERS,
+      ),
+    },
   };
 }
 
-/** Why `baseline` can't carry attribution for `origin`, as a notice. The
+/** Why `settings` can't carry attribution for `origin`, as a notice. The
  * origin is compared (scheme, host and port), never the mode path, and
  * headers only Claude's inherited env sets are never replaced.
  * `provider` is what Claude's `initialize` resolved, which also sees a
  * selector in its process env; only Anthropic's API ("firstParty") or an
  * older Claude that reports none passes. */
 export function ineligible(
-  baseline: Baseline,
+  settings: Settings,
   origin: string,
   provider?: string,
 ) {
-  if (baseline.provider || (provider !== undefined && provider !== FIRST_PARTY))
+  if (settings.provider || (provider !== undefined && provider !== FIRST_PARTY))
     return PROVIDER;
-  if (originOf(baseline.endpoint) !== originOf(origin)) return ELSEWHERE;
+  if (originOf(settings.endpoint) !== originOf(origin)) return ELSEWHERE;
+  if (settings.policy) return POLICY_HEADERS;
   // A settings value outranks the inherited one, which then never reaches
   // the endpoint; without one, applying ours would replace it for good.
-  if (baseline.headers === undefined && baseline.inherited !== false)
-    return baseline.inherited ? INHERITED : UNREADABLE;
+  if (settings.headers === undefined && settings.inherited !== false)
+    return settings.inherited ? INHERITED : UNREADABLE;
 }
 
-/** `baseline`'s lines without any header reserved to Buzz, whatever its case
+/** `own`'s lines without any header reserved to Buzz, whatever its case
  * or `_`/`-` spelling, then `bundle`'s: other headers pass through as the
  * person wrote them. */
 export function customHeaders(
   profile: GatewayProfile,
-  baseline: string | undefined,
+  own: string | undefined,
   bundle: GatewayHeaders,
 ) {
-  const kept = (baseline ?? "")
+  const kept = (own ?? "")
     .split(/\r?\n/)
     .filter(
       (line) =>

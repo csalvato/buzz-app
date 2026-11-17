@@ -1,5 +1,5 @@
-// Turns Agents deliveries into goose turns. Every agent of this type shares
-// one `goose-acp` process; a delivery becomes a prompt in the harness format,
+// Turns Agents deliveries into goose turns. Each agent of this type runs in
+// its own `goose-acp` process; a delivery becomes a prompt in the harness format,
 // sent to the agent's ACP session for its conversation; a watch or timer wake
 // runs as a one-off turn in a new session, in its Interest's lane. The run
 // returns once the turn is handed over, so one agent works in several
@@ -21,7 +21,7 @@ import {
   turnNote,
 } from "../../buzz-mcp/session-tools";
 import {
-  fromOwner,
+  mentionAuthority,
   type Agent,
   type AgentHandle,
   type Agents,
@@ -30,6 +30,12 @@ import {
   type TurnResult,
 } from "../../features/agents/service";
 import { ownerReads } from "../../features/agents/reads";
+import {
+  followRecommended,
+  onRecommended,
+  type RecommendedCandidate,
+  type RecommendedRun,
+} from "../../features/agents/recommended";
 import { soloChat } from "../../features/agents/solo-chat";
 import { SessionControls } from "../../features/agent-harness/session-control";
 import type {
@@ -83,12 +89,12 @@ import {
   type ToolServer,
 } from "./goose";
 import { forwardedTurn, GATEWAY_PROVIDER } from "./forwarded";
-import { marked, unforged } from "./transcript";
+import { marked, sessionTags, unforged } from "./transcript";
 import {
   absolute,
+  AgentProcess,
   AgentSessions,
   localSessions,
-  SharedProcess,
 } from "./sessions";
 
 export type Config = Readonly<{
@@ -117,6 +123,12 @@ export const config = (value: unknown): Config => ({
   ...DEFAULT_CONFIG,
   ...(value && typeof value === "object" ? (value as Partial<Config>) : {}),
 });
+/** What an agent runs on: its config, with `candidate`'s provider, model and
+ * thinking level in place of its own while it is on Recommended. */
+export const running = (
+  value: unknown,
+  candidate: RecommendedCandidate | null | undefined,
+): Config => followRecommended(value, config(value), candidate);
 
 const CONVERSATION_READ_TIMEOUT_MS = 4_000;
 const CHAT = [9, 40002];
@@ -149,7 +161,9 @@ export function sessionTitle(
 type Entry = {
   lifetime: AbortController;
   protected?: boolean;
-  worker?: SharedProcess;
+  /** Its own goose, stopped once the agent goes. */
+  goose: AgentProcess;
+  worker?: AgentProcess;
   workerKey?: string;
   /** Every replaced provider's worker, which its successor waits out. */
   stopping?: Promise<void>;
@@ -185,20 +199,15 @@ type Entry = {
 
 export class GooseRuntime {
   private readonly agents = new Map<string, Entry>();
-  /** The goose every agent's sessions open in. */
-  private readonly goose = new SharedProcess(
-    {
-      spawn: (id, options) => this.desktop.spawn(id, options),
-      resolveDirectory: (path) => this.desktop.resolveDirectory(path),
-    },
-    (handler) => this.serve(handler),
-  );
   private readonly memoryReads = new MemoryReads();
   private readonly listeners = new Set<() => void>();
   private readonly views = new Map<
     AgentKey,
     ReturnType<AgentSessions["snapshot"]>
   >();
+  /** A failed turn's error as its report says it, such as where to fix
+   * goose's provider key. */
+  explain: (error: string) => string = (error) => error;
 
   constructor(
     private readonly host: Host,
@@ -214,13 +223,31 @@ export class GooseRuntime {
       "",
     /** Agent storage, where what each session started with is kept. */
     private readonly agentStore: AgentStore = localStore(),
+    /** What agents on Recommended run on; found at the first such run. */
+    private readonly recommended?: RecommendedRun,
     /** Opens forwarded turns' generations; absent without a plugin owner. */
     private readonly forwarding?: GatewayForwarding,
     /** goose's own default provider, which an agent naming none runs on. */
     private readonly defaultProvider: () => Promise<
       string | undefined
     > = async () => undefined,
-  ) {}
+  ) {
+    // Once found, agents on Recommended take it up.
+    this.unfollow = recommended?.subscribe(() => this.sync(this.synced));
+  }
+  private readonly unfollow: (() => void) | undefined;
+  private synced: readonly Agent[] = [];
+  private settings(raw: unknown) {
+    return running(raw, this.recommended?.current());
+  }
+  /** Finds what agents on Recommended run on before `raw`'s first run. */
+  private async follow(raw: unknown) {
+    if (!this.recommended || !onRecommended(raw)) return;
+    // Only the first waits; a later retry, after nothing was offered, runs
+    // alongside.
+    const finding = this.recommended.find();
+    if (this.recommended.current() === undefined) await finding;
+  }
 
   /** What each of the agent's sessions started with. */
   prompts(agent: AgentKey) {
@@ -243,6 +270,11 @@ export class GooseRuntime {
     this.noticed.set(agent, notices);
   }
 
+  /** A file as the agent's sessions read one: in its saved workspace. */
+  workspaceFile(agent: Agent, path: string) {
+    return this.desktop.readFile(path, { cwd: config(agent.config).workspace });
+  }
+
   /** The desktop host's methods goose agents run with. */
   private get desktop() {
     const { host } = this;
@@ -261,8 +293,7 @@ export class GooseRuntime {
   }
 
   /** Brings the runtime in line with this type's agents: changed settings
-   * reopen idle sessions, and removed agents stop. goose stops with the
-   * last. */
+   * reopen idle sessions, and removed agents stop, each with its goose. */
   private defaultsRevision = 0;
 
   /** Reopen inherited sessions on their next idle turn after Goose defaults save. */
@@ -297,6 +328,7 @@ export class GooseRuntime {
         try {
           await entry?.stopping;
           await entry?.worker?.shutdown();
+          await entry?.goose.shutdown();
         } catch (error) {
           failure ??= { error };
         }
@@ -316,21 +348,16 @@ export class GooseRuntime {
       // A failed retirement is retried by the next one, not kept.
       if (this.retirements.get(pubkey) === retiring)
         this.retirements.delete(pubkey);
-      this.stopWithLast();
     }
   }
-  /** goose stops with the last agent, once its retirements are done. */
-  private stopWithLast() {
-    if (!this.agents.size && !this.retirements.size) this.goose.stop();
-  }
   sync(agents: readonly Agent[]) {
+    this.synced = agents;
     const current = new Set(agents.map((agent) => agent.key));
     for (const key of this.agents.keys())
       if (!current.has(key)) void this.retire(key).catch(() => undefined);
-    this.stopWithLast();
     for (const agent of agents) {
       if (this.retirements.has(agent.key)) continue;
-      const next = config(agent.config);
+      const next = this.settings(agent.config);
       const entry = this.agents.get(agent.key);
       if (!entry) {
         const created = this.entry(agent.key, next);
@@ -426,7 +453,7 @@ export class GooseRuntime {
   ) {
     const key = this.controlKey(agent, place);
     const control = `${agent.key}/${key}`;
-    const entry = this.entry(agent.key, config(agent.config));
+    const entry = this.entry(agent.key, this.settings(agent.config));
     if (action === "interrupt") {
       this.controls.interrupt(control);
       entry.policies.get(key)?.cancel();
@@ -458,13 +485,14 @@ export class GooseRuntime {
   }
 
   dispose() {
+    this.unfollow?.();
     for (const entry of this.agents.values()) {
       entry.lifetime.abort(new Error("The Goose runtime was disposed"));
       entry.sessions.dispose();
       entry.worker?.stop();
+      entry.goose.stop();
     }
     this.agents.clear();
-    this.goose.stop();
   }
 
   async run({
@@ -489,7 +517,6 @@ export class GooseRuntime {
     gateway: offered,
     gatewayFallback,
   }: Delivery) {
-    const settings = config(raw);
     // Unaddressed watches and timers come as standalone turns (`runOnce`).
     if (
       trigger.type !== "mention" &&
@@ -505,25 +532,21 @@ export class GooseRuntime {
     // goose runs commands as you; mentions need owner or delegated authority.
     if (trigger.type === "mention") {
       const snapshot = this.relay(agent.key)?.snapshot();
-      if (
-        !(await fromOwner(trigger.event, agent.owner, {
-          agent: agent.pubkey,
-          authority:
-            snapshot?.status === "ready"
-              ? snapshot.session.workflowAuthority
-              : undefined,
-          profiles:
-            snapshot?.status === "ready"
-              ? snapshot.session.profiles
-              : undefined,
-        }))
-      ) {
-        ignored?.();
-        return;
-      }
+      const authority = await mentionAuthority(trigger.event, agent.owner, {
+        agent: agent.pubkey,
+        authority:
+          snapshot?.status === "ready"
+            ? snapshot.session.workflowAuthority
+            : undefined,
+        profiles:
+          snapshot?.status === "ready" ? snapshot.session.profiles : undefined,
+      });
+      if (authority !== "owner") return ignored?.(authority);
       signal.throwIfAborted();
     }
-    const entry = this.entry(agent.key, settings);
+    // Found only for a delivery it takes, so nothing it drops starts goose.
+    await this.follow(raw);
+    const entry = this.entry(agent.key, this.settings(raw));
     entry.handle = agent;
     entry.team = team ?? "";
     const gateway = offered && (await this.routed(entry, offered));
@@ -614,6 +637,8 @@ export class GooseRuntime {
             entry,
             wait ? (await prompt(false, key)).text : prepared,
             notes,
+            channel,
+            noteRoot,
           );
           if (interrupted || this.agents.get(agent.key) !== entry) {
             delivered = Promise.resolve({ ok: true, undelivered: true });
@@ -635,7 +660,13 @@ export class GooseRuntime {
                 if (!fresh && !wake) return { text, shown };
                 const rebuilt = await prompt(fresh, key);
                 return {
-                  text: this.review(entry, rebuilt.text, notes),
+                  text: this.review(
+                    entry,
+                    rebuilt.text,
+                    notes,
+                    channel,
+                    noteRoot,
+                  ),
                   shown: rebuilt.shown,
                 };
               },
@@ -666,6 +697,8 @@ export class GooseRuntime {
                       entry,
                       (await prompt(fresh, key)).text,
                       notes,
+                      channel,
+                      noteRoot,
                     );
                     return marking ? marked(text, marking) : text;
                   },
@@ -673,7 +706,13 @@ export class GooseRuntime {
               : {}),
             steer: steerPrompt(text),
             fresh: async () =>
-              this.review(entry, (await prompt(true, key)).text, notes),
+              this.review(
+                entry,
+                (await prompt(true, key)).text,
+                notes,
+                channel,
+                noteRoot,
+              ),
             title: sessionTitle(entry.name, place, key.split("/")[1]),
             // A Solo chat takes the name goose gives its first session.
             ...(solo && named ? { named } : {}),
@@ -748,7 +787,8 @@ export class GooseRuntime {
     prompt,
   }: StandaloneTurn): Promise<TurnResult> {
     const { agent, team } = delivery;
-    const entry = this.entry(agent.key, config(delivery.config));
+    await this.follow(delivery.config);
+    const entry = this.entry(agent.key, this.settings(delivery.config));
     entry.handle = agent;
     entry.team = team ?? "";
     const standalone = async () => {
@@ -842,7 +882,14 @@ export class GooseRuntime {
   ): Promise<Settled> {
     const route = this.forwarding?.control(agent.key);
     if (route?.kind === "blocked")
-      return { ok: false, error: compactRefusal(fallbackNotice(route)) };
+      return {
+        ok: false,
+        // A refused sign-in fails as a turn does, not as a fallback.
+        error:
+          route.reason === "auth"
+            ? route.message
+            : compactRefusal(fallbackNotice(route.reason)),
+      };
     if (!route) return { ok: false, error: NOT_COMPACTED };
     const turn = controlTurn(place, config(agent.config).scope);
     const key = this.controlKey(agent, place);
@@ -949,6 +996,10 @@ export class GooseRuntime {
             // Its Buzz tools' server counts in the pool sessions share.
             serve: entry.sessions.pooled((handler) => this.serve(handler)),
             onProcess,
+            // Acts as the agent, as its ordinary goose does.
+            ...(entry.handle && {
+              agent: { pubkey: entry.handle.pubkey, relay: entry.handle.relay },
+            }),
           }),
         launch: async () => {
           ({ systemPrompt } = await this.launch(agent, entry));
@@ -957,6 +1008,7 @@ export class GooseRuntime {
         tools: entry.tools,
         choice: () => this.choice(entry),
         conversation: key,
+        tags: sessionTags(agent, held ? key : undefined),
         ...(turn.title ? { title: turn.title } : {}),
         ...(held?.saved ? { load: held.saved } : {}),
         prompt: async (fresh) => {
@@ -1032,10 +1084,18 @@ export class GooseRuntime {
   }
 
   /** `text` with the notes plugins left for the turn and the Buzz tools'
-   * end-of-turn note, when there are any. */
-  private review(entry: Entry, text: string, notes: readonly string[] = []) {
+   * end-of-turn note for its conversation, when there are any. */
+  private review(
+    entry: Entry,
+    text: string,
+    notes: readonly string[],
+    channelId: string,
+    root: string | undefined,
+  ) {
     return unforged(
-      [text, ...notes, turnNote(entry.handle)].filter(Boolean).join("\n\n"),
+      [text, ...notes, turnNote(entry.handle, channelId, root)]
+        .filter(Boolean)
+        .join("\n\n"),
     );
   }
 
@@ -1051,7 +1111,7 @@ export class GooseRuntime {
       agent,
       channel,
       event,
-      `⚠️ I couldn't finish that: ${error.slice(0, 500)}`,
+      `⚠️ I couldn't finish that: ${this.explain(error.slice(0, 500))}`,
       topLevel,
       [["p", agent.owner]],
     );
@@ -1211,6 +1271,15 @@ export class GooseRuntime {
       config: initial,
       team: "",
       sessions: undefined as unknown as AgentSessions,
+      goose: new AgentProcess(
+        {
+          spawn: (id, options) => this.desktop.spawn(id, options),
+          resolveDirectory: (path) => this.desktop.resolveDirectory(path),
+        },
+        (handler) => this.serve(handler),
+        undefined,
+        () => entry.handle,
+      ),
       tools: undefined as unknown as ToolServer,
       retiring: new Set(),
       forwarding: new Map(),
@@ -1219,12 +1288,29 @@ export class GooseRuntime {
     };
     // Every session of the agent shares them, so they read the settings, the
     // handle and the conversation's place as they are when called.
-    const tools: ToolServer = async (conversation, message) => {
+    const tools: ToolServer = async (conversation, message, workSignal) => {
       const handle = entry.handle;
+      // A call in a conversation answers only while its turn runs unstopped.
+      // A forwarded turn's session runs in its own goose, outside `sessions`;
+      // its work signal alone ends its calls.
+      const current =
+        conversation &&
+        !entry.forwarding.has(conversation) &&
+        entry.sessions.current(conversation);
+      const signal = AbortSignal.any([
+        entry.lifetime.signal,
+        workSignal ?? AbortSignal.abort(new Error("The turn has ended")),
+      ]);
       const client =
         handle &&
         appClient(handle, {
-          signal: entry.lifetime.signal,
+          signal,
+          callSignal: signal,
+          ...(current && {
+            check: () => {
+              if (!current()) throw new Error("The Goose turn has ended");
+            },
+          }),
           // Its pre-tool check reviews every call, Buzz's extension included.
           nativeToolGate: true,
           // Read from the process hosting the session, which it never starts.
@@ -1265,7 +1351,7 @@ export class GooseRuntime {
       if (!protection) {
         if (entry.protected)
           throw new Error("The protected agent has no live policy binding");
-        return this.goose.get();
+        return entry.goose.get();
       }
       protection.assertAvailable();
       // Another key means a replaced provider, which is already stopping its
@@ -1278,10 +1364,11 @@ export class GooseRuntime {
         delete entry.worker;
       }
       entry.workerKey = protection.key;
-      entry.worker ??= new SharedProcess(
+      entry.worker ??= new AgentProcess(
         this.desktop,
         (handler) => this.serve(handler),
         protection,
+        () => entry.handle,
       );
       const worker = entry.worker;
       const { stopping } = entry;
@@ -1301,17 +1388,17 @@ export class GooseRuntime {
           title: title ?? "",
           conversation: conversation ?? null,
         }),
+      tags: (conversation) => sessionTags(agent, conversation),
       onChange: () => this.notify(),
       // Read as each turn starts, so a change needs no restart.
       choice: () => this.choice(entry),
+      // The prompt's other parts, its instructions, team, name and core
+      // memory, reach a running session in place as its next turn starts.
       fingerprint: () =>
         JSON.stringify([
           entry.config.provider.trim() ? 0 : this.defaultsRevision,
           entry.config.workspace,
-          entry.config.instructions,
           entry.config.scope,
-          entry.team,
-          entry.name,
           addedKey(this.added()),
         ]),
       launch: () => this.launch(agent, entry),
