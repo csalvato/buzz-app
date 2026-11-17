@@ -7,7 +7,6 @@ import type { AgentExecution } from "../../features/agents/execution";
 import { ClaudeProcess } from "./claude";
 import { executionSpawn } from "./execution";
 import { ClaudeRuntime, DEFAULT_CONFIG } from "./runtime";
-import { REMOTE } from "./attribution";
 import { VECTOR_PROFILE } from "../../features/agents/gateway/vectors";
 import { localStore } from "../../features/agents/store";
 import { fileStore } from "../../features/agents/state";
@@ -394,7 +393,6 @@ it("resumes a saved target before its first post-restart compaction and gives Ne
 
 it("leaves a remote agent's Claude settings alone on an eligible gateway turn and its compaction", async () => {
   const f = await remoteFixture();
-  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   // A route that would attribute the same agent's local process.
   const gateway = {
     route: {
@@ -434,12 +432,51 @@ it("leaves a remote agent's Claude settings alone on an eligible gateway turn an
       ),
     ).toBe(true);
     expect(f.local).not.toHaveBeenCalled();
-    // Only the gateway turn says why; a compaction has no gateway here.
-    expect(warn).not.toHaveBeenCalledWith(REMOTE);
   } finally {
-    warn.mockRestore();
     await f.cleanup();
   }
+});
+
+it("says in a remote agent's transcript error that it isn't attributed, only where the gateway would", async () => {
+  const agent = "a".repeat(64);
+  const conversation = {
+    agent,
+    channelId: "room",
+    root: null,
+  } as unknown as Parameters<ClaudeRuntime["transcript"]>[0];
+  const remote = (route?: unknown) =>
+    new ClaudeRuntime(
+      { spawn: vi.fn() },
+      () => undefined,
+      async () => null,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async () => ({ provider: "test/remote" }),
+      undefined,
+      undefined,
+      undefined,
+      () => route as never,
+    );
+  const read = (runtime: ClaudeRuntime) =>
+    runtime.transcript(
+      conversation,
+      "/work",
+      false,
+      new AbortController().signal,
+    );
+  await expect(read(remote({ kind: "eligible" }))).rejects.toThrow(
+    new Error(
+      "Transcripts are unavailable for remote Claude agents. They aren't attributed in the agent gateway yet.",
+    ),
+  );
+  // Without a route, as with the gateway off, the message is unchanged.
+  await expect(read(remote())).rejects.toThrow(
+    new Error("Transcripts are unavailable for remote Claude agents."),
+  );
 });
 
 it("interrupts remote work with a stale binding cache and no relay scope", async () => {

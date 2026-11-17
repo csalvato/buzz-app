@@ -87,7 +87,7 @@ import {
   localSessions,
   Spare,
 } from "./sessions";
-import { PROTECTED, REMOTE, refused } from "./attribution";
+import { PROTECTED, refused } from "./attribution";
 import {
   bindSession,
   inferenceBundle,
@@ -211,6 +211,9 @@ const listing = (added: readonly AddedTool[]): Listing => ({
 
 /** How long a session start waits for the agent's recent notes. */
 const NOTES_WAIT_MS = 2_000;
+/** What a remote Claude agent's Activity shows instead of its transcript. */
+const REMOTE_TRANSCRIPTS =
+  "Transcripts are unavailable for remote Claude agents";
 /** The attribution notices kept for each agent, the oldest dropped first. */
 const NOTICE_LIMIT = 100;
 
@@ -703,7 +706,12 @@ export class ClaudeRuntime {
     signal: AbortSignal,
   ) {
     if (await this.inspect?.(conversation.agent))
-      throw new Error("Transcripts are unavailable for remote Claude agents.");
+      // Where the gateway would attribute it, also say that it isn't.
+      throw new Error(
+        this.gatewayRoute?.(conversation.agent)
+          ? `${REMOTE_TRANSCRIPTS}. They aren't attributed in the agent gateway yet.`
+          : `${REMOTE_TRANSCRIPTS}.`,
+      );
     const prompts = this.prompts(conversation.agent);
     return readTranscript(
       this.spawn,
@@ -1422,11 +1430,8 @@ export class ClaudeRuntime {
   ): Attribute {
     return async (process, saved) => {
       // Remote Claude is outside this rollout: its settings are never read
-      // or changed, and only a gateway turn says so.
-      if (this.target) {
-        if (gateway) noted(REMOTE);
-        return undefined;
-      }
+      // or changed. Its Activity says so (`transcript`).
+      if (this.target) return undefined;
       // Its pinned launch reads none of the person's settings, so no gateway.
       if (gateway && this.agents.get(agent)?.protected) {
         noted(PROTECTED);
