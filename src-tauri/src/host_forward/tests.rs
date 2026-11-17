@@ -1804,3 +1804,47 @@ fn goose_responses_route_is_inference() {
         Some(Class::Inference)
     );
 }
+
+#[tokio::test]
+async fn goose_parent_and_child_requests_strip_authorization() {
+    let mut gateway = fake_gateway().await;
+    let forward = ready(gateway.origin);
+    let mut generation = goose(&forward);
+    assert_eq!(
+        register(&forward, generation.id, "call-1", CHILD),
+        Registered::Registered
+    );
+    for (index, (session, child, path)) in [
+        (PARENT, false, "/serving-endpoints/model-a/invocations"),
+        (PARENT, false, "/serving-endpoints/responses"),
+        (CHILD, true, "/serving-endpoints/model-a/invocations"),
+        (CHILD, true, "/serving-endpoints/responses"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = reqwest::Client::new()
+            .post(format!("{}{path}", generation.url))
+            .header("Authorization", "Bearer owner-sentinel")
+            .header("agent-session-id", session)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = recv(&mut gateway.seen).await;
+        assert_eq!(seen.path, format!("/upstream/goose{path}"));
+        assert!(seen.headers.get(header::AUTHORIZATION).is_none());
+        assert_eq!(seen.headers["agent-session-id"], session);
+        for (name, value) in inference() {
+            assert_eq!(seen.headers.get_all(&name).iter().count(), 1, "{name}");
+            assert_eq!(seen.headers[&name], value, "{name}");
+        }
+        assert_eq!(seen.body, Bytes::from_static(b"{}"));
+        assert_eq!(
+            recv(&mut generation.events).await,
+            serde_json::json!({"type": "admitted", "request": index + 1, "class": "inference", "child": child})
+        );
+        assert_eq!(recv(&mut generation.events).await["type"], "finished");
+    }
+}
