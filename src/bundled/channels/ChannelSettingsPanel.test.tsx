@@ -22,17 +22,9 @@ import type { Role } from "../../features/communities/roster";
 import type { CommunityMembership } from "../moderation/membership";
 import type { ChannelDetailsCapability } from "../../features/relay/channel-details";
 
-const developer = vi.hoisted(() => ({ mode: true }));
-vi.mock("../../features/developer/mode", () => ({
-  get developerMode() {
-    return developer.mode;
-  },
-}));
-
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
-  developer.mode = true;
 });
 
 it("shows known channel details with diagnostics collapsed until requested", async () => {
@@ -157,21 +149,6 @@ it("does not invent unknown metadata and still exposes diagnostics without a cha
   expect(screen.queryByText("Channel ID")).not.toBeInTheDocument();
   await user.click(screen.getByText("Diagnostics"));
   expect(screen.getByText("Diagnostics content")).toBeVisible();
-});
-
-it("hides diagnostics outside developer mode", () => {
-  developer.mode = false;
-  render(
-    <ChannelSettingsPanel
-      scope="community:viewer"
-      channel={{ id: "alpha", name: "Alpha", channelType: "stream" }}
-      close={() => {}}
-    >
-      Diagnostics content
-    </ChannelSettingsPanel>,
-  );
-  expect(screen.queryByText("Diagnostics")).not.toBeInTheDocument();
-  expect(screen.queryByText("Diagnostics content")).not.toBeInTheDocument();
 });
 
 it.each([

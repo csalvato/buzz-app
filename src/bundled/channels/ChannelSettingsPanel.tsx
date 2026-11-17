@@ -25,7 +25,6 @@ import {
   generalAccessOptions,
   generalAccessValue,
 } from "../../features/channels/general-access";
-import { developerMode } from "../../features/developer/mode";
 import {
   GearIcon,
   CircleNotchIcon,
@@ -273,12 +272,10 @@ export function ChannelSettingsPanel({
           )}
           {editStatus}
           {setupTools}
-          {developerMode && (
-            <details className={styles.settingsDiagnostics}>
-              <summary>Diagnostics</summary>
-              <div className={styles.settingsTools}>{children}</div>
-            </details>
-          )}
+          <details className={styles.settingsDiagnostics}>
+            <summary>Diagnostics</summary>
+            <div className={styles.settingsTools}>{children}</div>
+          </details>
         </div>
       </div>
     </Panel>
