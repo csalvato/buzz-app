@@ -2162,10 +2162,13 @@ it("attaches the picked files that fit and names an empty one", async () => {
     name: "Could not attach 1 of 5 files",
   });
   expect(notice).toHaveAccessibleDescription("cloud-placeholder.png is empty.");
+  // Each file fades in, so wait for it rather than racing the notice.
   for (const name of names)
-    expect(
-      screen.getByRole("button", { name: `Remove ${name}` }),
-    ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: `Remove ${name}` }),
+      ).toBeVisible(),
+    );
   expect(
     screen.queryByRole("button", { name: "Remove cloud-placeholder.png" }),
   ).toBeNull();
