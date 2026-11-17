@@ -161,8 +161,8 @@ export type SearchInputProps = {
   input: RefObject<HTMLElement | null>;
   label?: string;
   scope?: { label: string; onRemove: () => void } | undefined;
-  /** A control that refines the scoped results, beside the scope chip. */
-  scopeAction?: ReactNode;
+  /** A control that refines the results, inside the field after Clear. */
+  fieldAction?: ReactNode;
   chips?: readonly SearchChip[] | undefined;
   onRemoveChip?: ((chip: SearchChip) => void) | undefined;
   /** Backspace before the text edits the last chip. */
@@ -210,7 +210,7 @@ export function SearchChoices({
   input,
   label = "Search Buzz",
   scope,
-  scopeAction,
+  fieldAction,
   children,
   footer,
   inlineSettings,
@@ -751,19 +751,16 @@ export function SearchChoices({
       data-search-peek={peek ? "" : undefined}
       {...highlight.listProps}
     >
-      {(scope || scopeAction) && (
+      {scope && (
         <div className="search-palette-scope-row">
-          {scope && (
-            <button
-              type="button"
-              className="search-palette-scope"
-              aria-label={`Remove ${scope.label} search scope`}
-              onClick={scope.onRemove}
-            >
-              {scope.label} <span aria-hidden="true">×</span>
-            </button>
-          )}
-          {scopeAction}
+          <button
+            type="button"
+            className="search-palette-scope"
+            aria-label={`Remove ${scope.label} search scope`}
+            onClick={scope.onRemove}
+          >
+            {scope.label} <span aria-hidden="true">×</span>
+          </button>
         </div>
       )}
       <div className="search-palette-controls">
@@ -790,6 +787,7 @@ export function SearchChoices({
               </span>
             ) : undefined
           }
+          trailing={fieldAction}
           inputRef={input}
           role="combobox"
           aria-controls={highlight.listId}
