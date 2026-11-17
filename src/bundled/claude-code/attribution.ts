@@ -83,7 +83,6 @@ export const POLICY_HEADERS = `${NOTICE}: a managed Claude policy sets its custo
 export const FOREIGN = `${NOTICE}: something other than Buzz set Claude's flag settings env, which Buzz's headers would replace.`;
 export const INHERITED = `${NOTICE}: Claude's custom headers come from the app's environment, which Buzz can't read to keep them.`;
 export const PROTECTED = `${NOTICE}: protected Claude agents keep their own pinned launch.`;
-export const REMOTE = `${NOTICE}: remote Claude agents aren't attributed yet.`;
 /** A shared-contract refusal (binding or context) as this turn's notice. */
 export const refused = (message: string) => `${NOTICE}: ${message}`;
 
