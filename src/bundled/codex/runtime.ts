@@ -2966,8 +2966,14 @@ export class CodexRuntime {
             at: Date.now(),
             ...(tools ? { tools } : {}),
           });
-        signal.throwIfAborted();
-        if (request.current && !request.current()) {
+        if (signal.aborted || (request.current && !request.current())) {
+          if (this.target && !resuming) {
+            // An empty remote thread has no rollout to resume on the next request.
+            const { [key]: _, ...kept } = entry.saved;
+            await this.storage.set(entry.storageKey, JSON.stringify(kept));
+            entry.saved = kept;
+          }
+          signal.throwIfAborted();
           restoreNotes(request);
           request.answered();
           this.status(agent.key, key, "Idle");
@@ -2975,6 +2981,7 @@ export class CodexRuntime {
           ready();
           return;
         }
+        signal.throwIfAborted();
         request.accepted?.();
         const turn = await rpc
           .request<{ turn: { id: string } }>("turn/start", {
