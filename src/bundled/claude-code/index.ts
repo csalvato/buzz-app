@@ -28,10 +28,6 @@ import { targetKey } from "../../features/navigation/targets";
 import type { ClaudeConnection } from "./ClaudeSettings";
 import { readUsage } from "./usage";
 
-/** Whether Claude declares its harness to the gateway, which attributes its
- * turns. Off until its live enabled-build check. */
-const GATEWAY = false;
-
 export { TYPE_ID };
 /** How often Buzz's copy of Claude looks for a new release. */
 const UPDATE_MS = 6 * 60 * 60_000;
@@ -148,16 +144,14 @@ export const apply: PluginModule["apply"] = (ctx) => {
     undefined,
     undefined,
     // A session control's route, as the runner decides a turn's.
-    GATEWAY
-      ? (key) => {
-          const route = routeFor(key);
-          return route.kind === "eligible" &&
-            route.harnesses.includes(HARNESS) &&
-            upstreamFor(HARNESS)
-            ? route
-            : undefined;
-        }
-      : undefined,
+    (key) => {
+      const route = routeFor(key);
+      return route.kind === "eligible" &&
+        route.harnesses.includes(HARNESS) &&
+        upstreamFor(HARNESS)
+        ? route
+        : undefined;
+    },
   );
   /** A Claude agent is running, so Buzz's copy is needed; unknown until the
    * agents have loaded. */
@@ -228,7 +222,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
   });
   agents.register<Config>({
     id: TYPE_ID,
-    ...(GATEWAY ? { gateway: { harness: HARNESS } } : {}),
+    // Declares its harness to the gateway, which attributes its turns.
+    gateway: { harness: HARNESS },
     execution: true,
     conversationFolders: true,
     hooks: { events: CLAUDE_HOOK_EVENTS },
