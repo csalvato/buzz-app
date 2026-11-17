@@ -22,6 +22,11 @@ import { MessageMarkdown } from "../../features/messages/MessageMarkdown";
 import { useReferenceDirectory } from "../../features/messages/ReferenceText";
 import { channelIcon } from "../../features/channels/channel-icon";
 import {
+  generalAccessOptions,
+  generalAccessValue,
+} from "../../features/channels/general-access";
+import { developerMode } from "../../features/developer/mode";
+import {
   GearIcon,
   CircleNotchIcon,
   CaretRightIcon,
@@ -229,6 +234,26 @@ export function ChannelSettingsPanel({
                       membership={membership}
                     />
                   )}
+                {channel.visibility &&
+                  openMembers &&
+                  (channel.channelType === "stream" ||
+                    channel.channelType === "forum") && (
+                    <SettingsDetail
+                      label="General access"
+                      value={
+                        generalAccessOptions[
+                          generalAccessValue({
+                            visibility: channel.visibility,
+                            joinRole: channel.joinRole,
+                          })
+                        ].label
+                      }
+                      trailingIcon={
+                        <CaretRightIcon size={16} aria-hidden="true" />
+                      }
+                      onOpen={openMembers}
+                    />
+                  )}
                 {channel.members && (
                   <SettingsDetail
                     label="Members"
@@ -245,10 +270,12 @@ export function ChannelSettingsPanel({
           )}
           {editStatus}
           {setupTools}
-          <details className={styles.settingsDiagnostics}>
-            <summary>Diagnostics</summary>
-            <div className={styles.settingsTools}>{children}</div>
-          </details>
+          {developerMode && (
+            <details className={styles.settingsDiagnostics}>
+              <summary>Diagnostics</summary>
+              <div className={styles.settingsTools}>{children}</div>
+            </details>
+          )}
         </div>
       </div>
     </Panel>

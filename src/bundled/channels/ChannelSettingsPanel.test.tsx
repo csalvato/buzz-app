@@ -21,9 +21,17 @@ import { PublishNotSent, PublishRejected } from "../../features/relay/outbox";
 import type { Role } from "../../features/communities/roster";
 import type { CommunityMembership } from "../moderation/membership";
 
+const developer = vi.hoisted(() => ({ mode: true }));
+vi.mock("../../features/developer/mode", () => ({
+  get developerMode() {
+    return developer.mode;
+  },
+}));
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  developer.mode = true;
 });
 
 it("shows known channel details with diagnostics collapsed until requested", async () => {
@@ -148,6 +156,83 @@ it("does not invent unknown metadata and still exposes diagnostics without a cha
   expect(screen.queryByText("Channel ID")).not.toBeInTheDocument();
   await user.click(screen.getByText("Diagnostics"));
   expect(screen.getByText("Diagnostics content")).toBeVisible();
+});
+
+it("hides diagnostics outside developer mode", () => {
+  developer.mode = false;
+  render(
+    <ChannelSettingsPanel
+      scope="community:viewer"
+      channel={{ id: "alpha", name: "Alpha", channelType: "stream" }}
+      close={() => {}}
+    >
+      Diagnostics content
+    </ChannelSettingsPanel>,
+  );
+  expect(screen.queryByText("Diagnostics")).not.toBeInTheDocument();
+  expect(screen.queryByText("Diagnostics content")).not.toBeInTheDocument();
+});
+
+it.each([
+  ["private", undefined, "Private"],
+  ["public", "guest", "View only"],
+  ["public", "member", "Public"],
+] as const)(
+  "shows %s/%s general access and opens members to change it",
+  async (visibility, joinRole, label) => {
+    const openMembers = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <ChannelSettingsPanel
+        scope="community:viewer"
+        channel={{
+          id: "alpha",
+          name: "Alpha",
+          channelType: "stream",
+          visibility,
+          joinRole,
+        }}
+        openMembers={openMembers}
+        close={() => {}}
+      >
+        Diagnostics
+      </ChannelSettingsPanel>,
+    );
+    const access = screen.getByRole("button", { name: "View general access" });
+    expect(access).toHaveAccessibleDescription(label);
+    await user.click(access);
+    expect(openMembers).toHaveBeenCalledWith(access);
+  },
+);
+
+it("leaves general access out when visibility is unknown or the chat is a DM", () => {
+  const { rerender } = render(
+    <ChannelSettingsPanel
+      scope="community:viewer"
+      channel={{ id: "alpha", name: "Alpha", channelType: "stream" }}
+      openMembers={() => {}}
+      close={() => {}}
+    >
+      Diagnostics
+    </ChannelSettingsPanel>,
+  );
+  expect(screen.queryByText("General access")).not.toBeInTheDocument();
+  rerender(
+    <ChannelSettingsPanel
+      scope="community:viewer"
+      channel={{
+        id: "dm",
+        name: "Someone",
+        channelType: "dm",
+        visibility: "private",
+      }}
+      openMembers={() => {}}
+      close={() => {}}
+    >
+      Diagnostics
+    </ChannelSettingsPanel>,
+  );
+  expect(screen.queryByText("General access")).not.toBeInTheDocument();
 });
 
 it("opens even an empty members list without an Edit ingress", async () => {
