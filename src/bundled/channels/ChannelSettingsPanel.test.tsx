@@ -20,6 +20,7 @@ import {
 import { PublishNotSent, PublishRejected } from "../../features/relay/outbox";
 import type { Role } from "../../features/communities/roster";
 import type { CommunityMembership } from "../moderation/membership";
+import type { ChannelDetailsCapability } from "../../features/relay/channel-details";
 
 const developer = vi.hoisted(() => ({ mode: true }));
 vi.mock("../../features/developer/mode", () => ({
@@ -192,6 +193,7 @@ it.each([
           visibility,
           joinRole,
         }}
+        details={detailsCapability(true)}
         openMembers={openMembers}
         close={() => {}}
       >
@@ -205,26 +207,57 @@ it.each([
   },
 );
 
-it("leaves general access out when visibility is unknown or the chat is a DM", () => {
-  const { rerender } = render(
-    <ChannelSettingsPanel
-      scope="community:viewer"
-      channel={{ id: "alpha", name: "Alpha", channelType: "stream" }}
-      openMembers={() => {}}
-      close={() => {}}
-    >
-      Diagnostics
-    </ChannelSettingsPanel>,
-  );
-  expect(screen.queryByText("General access")).not.toBeInTheDocument();
-  rerender(
+function detailsCapability(available: boolean): ChannelDetailsCapability {
+  return {
+    available,
+    load: vi.fn(() => new Promise<never>(() => {})),
+    save: vi.fn(async () => {}),
+    check: vi.fn(async () => {}),
+    snapshot: () => undefined,
+    subscribe: () => () => {},
+  };
+}
+
+it.each([
+  ["unknown visibility", { visibility: undefined }, true],
+  ["a DM", { channelType: "dm" }, true],
+  ["an archived channel", { archived: true }, true],
+  ["a cached channel", { cached: true }, true],
+  ["a connection without channel details", {}, false],
+] as const)(
+  "leaves general access out for %s, where Members can't show it",
+  (_, overrides, detailsAvailable) => {
+    render(
+      <ChannelSettingsPanel
+        scope="community:viewer"
+        channel={{
+          id: "alpha",
+          name: "Alpha",
+          channelType: "stream",
+          visibility: "public",
+          ...overrides,
+        }}
+        details={detailsCapability(detailsAvailable)}
+        openMembers={() => {}}
+        close={() => {}}
+      >
+        Diagnostics
+      </ChannelSettingsPanel>,
+    );
+    expect(screen.queryByText("General access")).not.toBeInTheDocument();
+  },
+);
+
+it("shows general access read-only previews without channel details", () => {
+  render(
     <ChannelSettingsPanel
       scope="community:viewer"
       channel={{
-        id: "dm",
-        name: "Someone",
-        channelType: "dm",
-        visibility: "private",
+        id: "alpha",
+        name: "Alpha",
+        channelType: "forum",
+        visibility: "public",
+        readOnly: true,
       }}
       openMembers={() => {}}
       close={() => {}}
@@ -232,7 +265,9 @@ it("leaves general access out when visibility is unknown or the chat is a DM", (
       Diagnostics
     </ChannelSettingsPanel>,
   );
-  expect(screen.queryByText("General access")).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "View general access" }),
+  ).toHaveAccessibleDescription("Public");
 });
 
 it("opens even an empty members list without an Edit ingress", async () => {

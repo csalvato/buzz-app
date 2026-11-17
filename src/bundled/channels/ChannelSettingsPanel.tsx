@@ -237,7 +237,10 @@ export function ChannelSettingsPanel({
                 {channel.visibility &&
                   openMembers &&
                   (channel.channelType === "stream" ||
-                    channel.channelType === "forum") && (
+                    channel.channelType === "forum") &&
+                  !channel.cached &&
+                  !channel.archived &&
+                  (channel.readOnly || details?.available) && (
                     <SettingsDetail
                       label="General access"
                       value={
